@@ -253,6 +253,24 @@ fn find_nvidia_smi() -> Option<String> {
                 return Some(path.to_string());
             }
         }
+
+        // DriverStore fallback — nvidia-smi lives here on some Windows installs
+        let driver_store = std::path::Path::new(r"C:\Windows\System32\DriverStore\FileRepository");
+        if driver_store.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(driver_store) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    if let Some(name_str) = name.to_str() {
+                        if name_str.starts_with("nv") {
+                            let candidate = entry.path().join("nvidia-smi.exe");
+                            if candidate.exists() {
+                                return Some(candidate.to_string_lossy().to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     None
@@ -866,16 +884,30 @@ fn python_cmd() -> &'static str {
     { "python3" }
     #[cfg(windows)]
     {
-        // Windows: try "python3" first (newer installs), fall back to "python"
-        static PYTHON: std::sync::OnceLock<&str> = std::sync::OnceLock::new();
-        PYTHON.get_or_init(|| {
-            if Command::new(python_cmd()).arg("--version").output()
+        // Windows: try "python3" first, then "python", then embedded fallback
+        static PYTHON: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let s: &String = PYTHON.get_or_init(|| {
+            if Command::new("python3").arg("--version").output()
                 .map(|o| o.status.success()).unwrap_or(false) {
-                "python3"
+                "python3".to_string()
+            } else if Command::new("python").arg("--version").output()
+                .map(|o| o.status.success()).unwrap_or(false) {
+                "python".to_string()
+            } else if let Ok(dcp) = dcp_home() {
+                let embedded = dcp.join("python").join("python.exe");
+                if embedded.exists() {
+                    embedded.to_string_lossy().into_owned()
+                } else {
+                    "python".to_string()
+                }
             } else {
-                "python"
+                "python".to_string()
             }
-        })
+        });
+        // SAFETY: OnceLock ensures the String lives for 'static; we leak a &str ref.
+        // This is fine — it's a one-time allocation that lives for the process lifetime.
+        let leaked: &'static str = unsafe { &*(s.as_str() as *const str) };
+        leaked
     }
 }
 
@@ -1809,10 +1841,23 @@ async fn install_engine() -> Result<String, String> {
 
     #[cfg(target_os = "windows")]
     {
-        let output = Command::new("powershell")
-            .args(["-Command", "winget install Ollama.Ollama --accept-package-agreements --accept-source-agreements"])
+        // Download OllamaSetup.exe directly — works on all Windows 10+ without winget
+        let installer_path = dcp_home()?.join("OllamaSetup.exe");
+        let response = reqwest::get("https://github.com/ollama/ollama/releases/latest/download/OllamaSetup.exe")
+            .await
+            .map_err(|e| format!("Failed to download Ollama installer: {}", e))?;
+        let bytes = response.bytes().await
+            .map_err(|e| format!("Failed to read Ollama installer bytes: {}", e))?;
+        std::fs::write(&installer_path, &bytes)
+            .map_err(|e| format!("Failed to save OllamaSetup.exe: {}", e))?;
+
+        let output = Command::new(&installer_path)
+            .args(["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"])
             .output()
-            .map_err(|e| format!("Failed to install Ollama: {}", e))?;
+            .map_err(|e| format!("Failed to run Ollama installer: {}", e))?;
+
+        // Clean up installer
+        let _ = std::fs::remove_file(&installer_path);
 
         if output.status.success() {
             Ok("Ollama installed successfully".to_string())
@@ -2148,7 +2193,22 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
         }
     } else {
         // Ollama — cross-platform install
-        let ollama_installed = command_exists("ollama");
+        #[allow(unused_mut)]
+        let mut ollama_installed = command_exists("ollama");
+
+        // Windows fallback: check known install path if not found in PATH
+        #[cfg(windows)]
+        if !ollama_installed {
+            if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+                let ollama_path = std::path::PathBuf::from(local_app_data)
+                    .join("Programs")
+                    .join("Ollama")
+                    .join("ollama.exe");
+                if ollama_path.exists() {
+                    ollama_installed = true;
+                }
+            }
+        }
 
         if !ollama_installed {
             #[cfg(unix)]
@@ -2163,11 +2223,24 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
             }
             #[cfg(windows)]
             {
-                // On Windows, download and run the Ollama installer silently
-                let install = Command::new("powershell")
-                    .args(["-Command", "winget install Ollama.Ollama --accept-package-agreements --accept-source-agreements"])
+                // Download OllamaSetup.exe directly — works on all Windows 10+ without winget
+                let installer_path = dcp_home()?.join("OllamaSetup.exe");
+                let response = reqwest::get("https://github.com/ollama/ollama/releases/latest/download/OllamaSetup.exe")
+                    .await
+                    .map_err(|e| format!("Failed to download Ollama installer: {}", e))?;
+                let bytes = response.bytes().await
+                    .map_err(|e| format!("Failed to read Ollama installer bytes: {}", e))?;
+                std::fs::write(&installer_path, &bytes)
+                    .map_err(|e| format!("Failed to save OllamaSetup.exe: {}", e))?;
+
+                let install = Command::new(&installer_path)
+                    .args(["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"])
                     .output()
-                    .map_err(|e| format!("Ollama install failed: {}", e))?;
+                    .map_err(|e| format!("Failed to run Ollama installer: {}", e))?;
+
+                // Clean up installer
+                let _ = std::fs::remove_file(&installer_path);
+
                 if !install.status.success() {
                     return Err("Failed to install Ollama. Install manually from https://ollama.com/download/windows".to_string());
                 }
@@ -2287,6 +2360,109 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
             if !pull.status.success() {
                 let stderr = String::from_utf8_lossy(&pull.stderr).to_string();
                 return Err(format!("ollama pull {} failed: {}", model, stderr));
+            }
+        }
+    }
+
+    // Step 3.5 (Windows only): Ensure Python is available, install embedded Python if needed
+    #[cfg(windows)]
+    {
+        let python_ok = Command::new(python_cmd())
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        if !python_ok {
+            let python_dir = dcp_dir.join("python");
+            let python_exe = python_dir.join("python.exe");
+
+            if !python_exe.exists() {
+                // Download embeddable Python 3.11.9 (~11MB)
+                let zip_path = dcp_dir.join("python-embed.zip");
+                let client = reqwest::Client::new();
+                let resp = client
+                    .get("https://www.python.org/ftp/python/3.11.9/python-3.11.9-embed-amd64.zip")
+                    .send()
+                    .await
+                    .map_err(|e| format!("Python download failed: {}", e))?;
+                if !resp.status().is_success() {
+                    return Err(format!("Python download HTTP {}", resp.status()));
+                }
+                let zip_bytes = resp.bytes().await
+                    .map_err(|e| format!("Python download read failed: {}", e))?;
+                std::fs::write(&zip_path, &zip_bytes)
+                    .map_err(|e| format!("Python zip write failed: {}", e))?;
+
+                // Extract using PowerShell
+                let extract = Command::new("powershell")
+                    .args([
+                        "-NoProfile", "-Command",
+                        &format!(
+                            "Expand-Archive -Force -Path '{}' -DestinationPath '{}'",
+                            zip_path.display(),
+                            python_dir.display()
+                        ),
+                    ])
+                    .output()
+                    .map_err(|e| format!("Python extract failed: {}", e))?;
+                if !extract.status.success() {
+                    let stderr = String::from_utf8_lossy(&extract.stderr);
+                    return Err(format!("Python extract failed: {}", stderr));
+                }
+
+                // Clean up zip
+                let _ = std::fs::remove_file(&zip_path);
+
+                // Patch python311._pth to enable import site (required for pip)
+                let pth_path = python_dir.join("python311._pth");
+                if pth_path.exists() {
+                    let mut pth_content = std::fs::read_to_string(&pth_path)
+                        .map_err(|e| format!("Failed to read _pth file: {}", e))?;
+                    if !pth_content.contains("import site") || pth_content.contains("#import site") {
+                        pth_content = pth_content.replace("#import site", "import site");
+                        if !pth_content.contains("import site") {
+                            pth_content.push_str("\nimport site\n");
+                        }
+                        std::fs::write(&pth_path, &pth_content)
+                            .map_err(|e| format!("Failed to patch _pth file: {}", e))?;
+                    }
+                }
+
+                // Download and run get-pip.py
+                let getpip_path = dcp_dir.join("get-pip.py");
+                let pip_resp = client
+                    .get("https://bootstrap.pypa.io/get-pip.py")
+                    .send()
+                    .await
+                    .map_err(|e| format!("get-pip download failed: {}", e))?;
+                if !pip_resp.status().is_success() {
+                    return Err(format!("get-pip download HTTP {}", pip_resp.status()));
+                }
+                let pip_bytes = pip_resp.bytes().await
+                    .map_err(|e| format!("get-pip read failed: {}", e))?;
+                std::fs::write(&getpip_path, &pip_bytes)
+                    .map_err(|e| format!("get-pip write failed: {}", e))?;
+
+                let pip_install = Command::new(&python_exe)
+                    .arg(&getpip_path)
+                    .output()
+                    .map_err(|e| format!("get-pip run failed: {}", e))?;
+                if !pip_install.status.success() {
+                    let stderr = String::from_utf8_lossy(&pip_install.stderr);
+                    return Err(format!("pip bootstrap failed: {}", stderr));
+                }
+                let _ = std::fs::remove_file(&getpip_path);
+
+                // Install required packages
+                let deps = Command::new(&python_exe)
+                    .args(["-m", "pip", "install", "requests", "psutil"])
+                    .output()
+                    .map_err(|e| format!("pip install deps failed: {}", e))?;
+                if !deps.status.success() {
+                    let stderr = String::from_utf8_lossy(&deps.stderr);
+                    return Err(format!("pip install requests psutil failed: {}", stderr));
+                }
             }
         }
     }
@@ -2489,6 +2665,13 @@ pub fn run() {
             update_daemon,
             full_start_provider,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app, event| {
+            if let tauri::RunEvent::ExitRequested { code, api, .. } = event {
+                if code.is_none() {
+                    api.prevent_exit();
+                }
+            }
+        });
 }
