@@ -328,6 +328,13 @@ export function Dashboard() {
       try {
         const ds = await getDaemonStatus();
         setDaemonStatus(ds);
+        // Drive uptime from real daemon uptime (ticks every 10s)
+        if (ds.uptime_seconds > 0) {
+          setPerformance((prev) => ({
+            ...prev,
+            uptimeHours: ds.uptime_seconds / 3600, // fractional hours for precision
+          }));
+        }
       } catch (err) {
         console.error("Daemon status poll failed:", err);
       }
@@ -423,7 +430,7 @@ export function Dashboard() {
         setPerformance((prev) => ({
           ...prev,
           jobsCompleted: metrics.jobs_completed,
-          uptimeHours: Math.round(metrics.total_compute_minutes / 60),
+          // uptimeHours now driven by daemon status, not backend metrics
         }));
       } catch (err) {
         console.error("Metrics poll failed:", err);
@@ -798,6 +805,9 @@ export function Dashboard() {
 
   // Uptime today — use performance data if available
   const uptimeToday = performance.uptimeHours > 0 ? Math.min(performance.uptimeHours, 24) : 0;
+  const uptimeH = Math.floor(uptimeToday);
+  const uptimeM = Math.floor((uptimeToday - uptimeH) * 60);
+  const uptimeDisplay = uptimeToday > 0 ? `${uptimeH}h ${uptimeM}m / 24h` : "0h 0m / 24h";
 
   // Feature 7: Payout progress — use real claimable earnings
   const payoutCurrent = earnings.month;
@@ -1149,7 +1159,7 @@ export function Dashboard() {
               max={24}
               label="Uptime Today"
               color="#00E5C8"
-              displayValue={`${uptimeToday}h / 24h`}
+              displayValue={uptimeDisplay}
             />
           </div>
         </section>
