@@ -1940,6 +1940,95 @@ async fn update_daemon(api_key: String) -> Result<String, String> {
     Ok(format!("updated:{}", version))
 }
 
+// ── Cloudflare Tunnel for NAT Traversal ─────────────────────────────
+
+/// Download cloudflared binary if not present, start tunnel, return the URL
+async fn start_cloudflare_tunnel(dcp_dir: &std::path::Path, port: u16) -> Result<String, String> {
+    // Kill any existing tunnel
+    kill_by_name("cloudflared");
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    // Determine cloudflared binary path
+    let cloudflared_path = dcp_dir.join(if cfg!(windows) { "cloudflared.exe" } else { "cloudflared" });
+
+    // Download if not present
+    if !cloudflared_path.exists() {
+        let download_url = if cfg!(target_os = "windows") {
+            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+        } else if cfg!(target_os = "macos") {
+            if cfg!(target_arch = "aarch64") {
+                "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-amd64.tgz"
+            } else {
+                "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-amd64.tgz"
+            }
+        } else {
+            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+        };
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .unwrap_or_default();
+        let resp = client.get(download_url).send().await
+            .map_err(|e| format!("cloudflared download failed: {}", e))?;
+        if !resp.status().is_success() {
+            return Err(format!("cloudflared download HTTP {}", resp.status()));
+        }
+        let bytes = resp.bytes().await
+            .map_err(|e| format!("cloudflared read failed: {}", e))?;
+        std::fs::write(&cloudflared_path, &bytes)
+            .map_err(|e| format!("cloudflared write failed: {}", e))?;
+
+        // Make executable on Unix
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&cloudflared_path,
+                std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    // Start the tunnel
+    let tunnel_log = dcp_dir.join("cloudflared.log");
+    let log_file = std::fs::File::create(&tunnel_log)
+        .map_err(|e| format!("Tunnel log create failed: {}", e))?;
+
+    let _tunnel = Command::new(&cloudflared_path)
+        .args(["tunnel", "--url", &format!("http://localhost:{}", port), "--no-autoupdate"])
+        .stdout(std::process::Stdio::null())
+        .stderr(log_file)
+        .spawn()
+        .map_err(|e| format!("cloudflared start failed: {}", e))?;
+
+    // Wait for tunnel URL to appear in logs (up to 15 seconds)
+    let mut tunnel_url = String::new();
+    for _ in 0..30 {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        if let Ok(log_content) = std::fs::read_to_string(&tunnel_log) {
+            // cloudflared prints the URL like: https://xxx-yyy.trycloudflare.com
+            for line in log_content.lines() {
+                if let Some(start) = line.find("https://") {
+                    let url_part = &line[start..];
+                    if url_part.contains(".trycloudflare.com") {
+                        // Extract just the URL
+                        let end = url_part.find(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+                            .unwrap_or(url_part.len());
+                        tunnel_url = url_part[..end].to_string();
+                        break;
+                    }
+                }
+            }
+            if !tunnel_url.is_empty() { break; }
+        }
+    }
+
+    if tunnel_url.is_empty() {
+        return Err("cloudflared started but no tunnel URL found in logs".to_string());
+    }
+
+    Ok(tunnel_url)
+}
+
 // ── Full Provider Start (chains: engine install → model download → inference server → daemon) ──
 
 #[tauri::command]
@@ -2246,6 +2335,32 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
         guard.status = "running".to_string();
         guard.started_at = Some(std::time::Instant::now());
         guard.restart_count = 0;
+    }
+
+    // Step 5: Start Cloudflare Tunnel for NAT traversal
+    // This exposes the local inference server to the internet so the backend can route jobs
+    let inference_port = if engine == "mlx" { 8000 } else { 11434 };
+    let tunnel_url = start_cloudflare_tunnel(&dcp_dir, inference_port).await.unwrap_or_default();
+
+    // Step 6: Register tunnel URL with backend
+    if !tunnel_url.is_empty() {
+        let client = reqwest::Client::new();
+        let _ = client.post(format!("{}/endpoint", API_BASE))
+            .json(&serde_json::json!({
+                "key": api_key,
+                "vllm_endpoint_url": tunnel_url
+            }))
+            .send()
+            .await;
+
+        // Save tunnel URL to config
+        let config_path = dcp_dir.join("config.json");
+        if let Ok(content) = std::fs::read_to_string(&config_path) {
+            if let Ok(mut config) = serde_json::from_str::<serde_json::Value>(&content) {
+                config["tunnel_url"] = serde_json::Value::String(tunnel_url.clone());
+                let _ = std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap_or_default());
+            }
+        }
     }
 
     Ok(format!("started:{}:{}:{}:{}", engine, model, pid, if model_cached { "cached" } else { "downloaded" }))
