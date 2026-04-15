@@ -37,6 +37,21 @@ function App() {
     async function init() {
       const setupDone = await checkSetupComplete();
       setView(setupDone ? "dashboard" : "wizard");
+
+      // Check for app updates (silent, non-blocking)
+      try {
+        const { check } = await import("@tauri-apps/plugin-updater");
+        const update = await check();
+        if (update?.available) {
+          console.log(`Update available: ${update.version}`);
+          await update.downloadAndInstall();
+          // Relaunch after install
+          const { relaunch } = await import("@tauri-apps/plugin-process");
+          await relaunch();
+        }
+      } catch (e) {
+        console.log("Update check skipped:", e);
+      }
     }
     init();
   }, []);

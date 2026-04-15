@@ -370,10 +370,10 @@ export function Dashboard() {
 
         // Update earnings from real data (halala -> SAR)
         setEarnings({
-          today: data.today_earnings_halala / 100,
-          week: data.week_earnings_halala / 100,
-          month: data.claimable_earnings_halala / 100,
-          allTime: data.total_earnings,
+          today: (data.today_earnings_halala || 0) / 100,
+          week: (data.week_earnings_halala || 0) / 100,
+          month: (data.claimable_earnings_halala || data.total_earnings || 0) / 100,
+          allTime: (data.total_earnings || 0) / 100,
         });
 
         // Update performance

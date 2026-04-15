@@ -16,6 +16,8 @@
     "autostart:allow-disable",
     "autostart:allow-is-enabled",
     "updater:default",
+    "process:allow-restart",
+    "process:allow-exit",
     "store:allow-get",
     "store:allow-set",
     "store:allow-delete",
