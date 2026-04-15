@@ -958,6 +958,34 @@ fn command_exists(name: &str) -> bool {
     }
 }
 
+/// Find the Ollama executable (checks PATH + known Windows install path)
+fn ollama_cmd() -> String {
+    if command_exists("ollama") {
+        return "ollama".to_string();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // Ollama Inno Setup installs to %LOCALAPPDATA%\Programs\Ollama
+        if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+            let ollama_path = format!(r"{}\Programs\Ollama\ollama.exe", local_app_data);
+            if std::path::Path::new(&ollama_path).exists() {
+                return ollama_path;
+            }
+        }
+        // Also check Program Files
+        let alt_paths = [
+            r"C:\Program Files\Ollama\ollama.exe",
+            r"C:\Program Files (x86)\Ollama\ollama.exe",
+        ];
+        for p in &alt_paths {
+            if std::path::Path::new(p).exists() {
+                return p.to_string();
+            }
+        }
+    }
+    "ollama".to_string() // fallback — will fail with clear error
+}
+
 /// Find the Python executable (python3 on Unix, python on Windows)
 fn python_cmd() -> &'static str {
     #[cfg(unix)]
@@ -1450,7 +1478,7 @@ async fn check_daemon_health() -> Result<HealthReport, String> {
     }
 
     // 5. Model downloaded? Check ollama list or mlx model dir
-    let model_check = Command::new("ollama").arg("list").output();
+    let model_check = Command::new(&ollama_cmd()).arg("list").output();
     match model_check {
         Ok(o) if o.status.success() => {
             let output = String::from_utf8_lossy(&o.stdout).to_string();
@@ -1971,7 +1999,7 @@ async fn download_model(model_name: String) -> Result<String, String> {
     let has_ollama = command_exists("ollama");
 
     if has_ollama {
-        let output = Command::new("ollama")
+        let output = Command::new(&ollama_cmd())
             .args(["pull", &model_name])
             .output()
             .map_err(|e| format!("Failed to pull model: {}", e))?;
@@ -2437,7 +2465,7 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
         };
 
         if !ollama_running {
-            let _serve = Command::new("ollama")
+            let _serve = Command::new(&ollama_cmd())
                 .arg("serve")
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
@@ -2458,14 +2486,14 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
         }
 
         // Check if model already pulled
-        let list_output = Command::new("ollama").args(["list"]).output();
+        let list_output = Command::new(&ollama_cmd()).args(["list"]).output();
         model_cached = list_output.ok()
             .map(|o| String::from_utf8_lossy(&o.stdout).contains(&model))
             .unwrap_or(false);
 
         if !model_cached {
             // Pull the model
-            let pull = Command::new("ollama")
+            let pull = Command::new(&ollama_cmd())
                 .args(["pull", &model])
                 .output()
                 .map_err(|e| format!("Model pull failed: {}", e))?;
