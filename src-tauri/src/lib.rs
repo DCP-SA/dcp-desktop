@@ -2581,20 +2581,36 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
 
     log_startup!("Step 3: Model ready — cached={}, engine running on port {}", model_cached, if engine == "mlx" { 8000 } else { 11434 });
 
-    // Step 4: Download + start the DCP daemon
+    // Step 4: Always download latest daemon (auto-update on every start)
     let daemon_path = dcp_dir.join("dcp_daemon.py");
-    if !daemon_path.exists() {
+    {
         let url = format!("https://api.dcp.sa/api/providers/download/daemon?key={}", api_key);
-        let client = reqwest::Client::new();
-        let resp = client.get(&url).send().await
-            .map_err(|e| format!("Daemon download failed: {}", e))?;
-        if !resp.status().is_success() {
-            return Err(format!("Daemon download HTTP {}", resp.status()));
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_default();
+        match client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.bytes().await {
+                    Ok(bytes) => {
+                        let _ = std::fs::write(&daemon_path, &bytes);
+                        log_startup!("Step 4a: Daemon downloaded ({} bytes)", bytes.len());
+                    }
+                    Err(e) => {
+                        log_startup!("Step 4a: Daemon download read failed: {} (using cached)", e);
+                    }
+                }
+            }
+            Ok(resp) => {
+                log_startup!("Step 4a: Daemon download HTTP {} (using cached)", resp.status());
+            }
+            Err(e) => {
+                log_startup!("Step 4a: Daemon download failed: {} (using cached if exists)", e);
+            }
         }
-        let bytes = resp.bytes().await
-            .map_err(|e| format!("Daemon read failed: {}", e))?;
-        std::fs::write(&daemon_path, &bytes)
-            .map_err(|e| format!("Daemon write failed: {}", e))?;
+        if !daemon_path.exists() {
+            return Err("Daemon file not found and download failed. Check internet connection.".to_string());
+        }
     }
 
     let log_path = dcp_dir.join("daemon.log");
