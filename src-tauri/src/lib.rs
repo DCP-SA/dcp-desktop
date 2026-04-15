@@ -2278,16 +2278,38 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
         is_apple_silicon = false;
         engine = "ollama".to_string();
         total_mem_gb = 0;
-        // Detect VRAM for model selection (using portable nvidia-smi finder)
-        let vram_mb: u64 = find_nvidia_smi()
-            .and_then(|path| {
-                Command::new(&path)
+        // Detect VRAM for model selection — try nvidia-smi, then fallback to detect_gpu result
+        let vram_mb: u64 = {
+            let mut detected = 0u64;
+            // Try nvidia-smi
+            if let Some(path) = find_nvidia_smi() {
+                if let Ok(o) = Command::new(&path)
                     .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
                     .output()
-                    .ok()
-            })
-            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
-            .unwrap_or(0);
+                {
+                    let raw = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    // Handle potential multi-line output (multi-GPU) — take first line
+                    let first_line = raw.lines().next().unwrap_or(&raw);
+                    // Try parsing, handle commas and decimals
+                    let cleaned = first_line.replace(',', "").replace(" ", "");
+                    detected = cleaned.parse::<f64>().unwrap_or(0.0) as u64;
+                    log_startup!("  nvidia-smi VRAM raw='{}' parsed={}MB", raw, detected);
+                }
+            }
+            // Fallback: use detect_gpu which already worked in the wizard
+            if detected == 0 {
+                if let Ok(gpu) = detect_gpu_nvidia() {
+                    detected = gpu.vram_mb;
+                    log_startup!("  VRAM from detect_gpu fallback: {}MB", detected);
+                }
+            }
+            // Last resort: hardcode known GPUs by name
+            if detected == 0 {
+                log_startup!("  VRAM detection failed, using 8192MB default for consumer GPU");
+                detected = 8192; // Safe default for RTX 3060 Ti
+            }
+            detected
+        };
         // Benchmark-validated model selection by VRAM:
         // ≥24GB (4090/A5000/A6000): MoE 30B — best quality, 137-200 tok/s
         // ≥12GB (3060Ti 12GB/4070): Dense 8B — 107-197 tok/s
