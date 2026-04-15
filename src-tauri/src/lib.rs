@@ -860,6 +860,17 @@ async fn read_config() -> Result<SavedConfig, String> {
     })
 }
 
+/// Hide console windows on Windows for spawned processes
+#[cfg(target_os = "windows")]
+fn hide_window(cmd: &mut Command) -> &mut Command {
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(0x08000000) // CREATE_NO_WINDOW
+}
+#[cfg(not(target_os = "windows"))]
+fn hide_window(cmd: &mut Command) -> &mut Command {
+    cmd // no-op on Unix
+}
+
 /// Simple timestamp for logging (no chrono dependency)
 fn chrono_now() -> String {
     let d = std::time::SystemTime::now()
@@ -2160,11 +2171,12 @@ async fn start_cloudflare_tunnel(dcp_dir: &std::path::Path, port: u16) -> Result
     let log_file = std::fs::File::create(&tunnel_log)
         .map_err(|e| format!("Tunnel log create failed: {}", e))?;
 
-    let _tunnel = Command::new(&cloudflared_path)
-        .args(["tunnel", "--url", &format!("http://localhost:{}", port), "--no-autoupdate"])
-        .stdout(std::process::Stdio::null())
-        .stderr(log_file)
-        .spawn()
+    let _tunnel = hide_window(
+        Command::new(&cloudflared_path)
+            .args(["tunnel", "--url", &format!("http://localhost:{}", port), "--no-autoupdate"])
+            .stdout(std::process::Stdio::null())
+            .stderr(log_file)
+    ).spawn()
         .map_err(|e| format!("cloudflared start failed: {}", e))?;
 
     // Wait for tunnel URL to appear in logs (up to 15 seconds)
@@ -2487,12 +2499,13 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
         };
 
         if !ollama_running {
-            let _serve = Command::new(&ollama_cmd())
-                .arg("serve")
-                .env("OLLAMA_HOST", "0.0.0.0")  // Listen on all interfaces for tunnel access
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
+            let _serve = hide_window(
+                Command::new(&ollama_cmd())
+                    .arg("serve")
+                    .env("OLLAMA_HOST", "0.0.0.0")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+            ).spawn()
                 .map_err(|e| format!("Failed to start Ollama: {}", e))?;
             // Wait for it to be ready
             let client = reqwest::Client::builder()
@@ -2671,15 +2684,17 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
     let err_file = std::fs::File::create(&err_log_path)
         .map_err(|e| format!("Error log create failed: {}", e))?;
 
-    let child = Command::new(python_cmd())
-        .arg(&daemon_path)
-        .arg("--no-watchdog")
-        .arg("--key").arg(&api_key)
-        .arg("--url").arg("https://api.dcp.sa")
-        .env("DCP_SERVED_MODEL", &model)
-        .env("DCP_ENGINE", &engine)
-        .stdout(log_file)
-        .stderr(err_file)
+    let child = hide_window(
+        Command::new(python_cmd())
+            .arg(&daemon_path)
+            .arg("--no-watchdog")
+            .arg("--key").arg(&api_key)
+            .arg("--url").arg("https://api.dcp.sa")
+            .env("DCP_SERVED_MODEL", &model)
+            .env("DCP_ENGINE", &engine)
+            .stdout(log_file)
+            .stderr(err_file)
+    )
         .spawn()
         .map_err(|e| format!("Daemon spawn failed: {}", e))?;
 
