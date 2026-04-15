@@ -1,6 +1,6 @@
 [package]
 name = "dcp-desktop"
-version = "0.1.0"
+version = "0.2.0"
 description = "DCP GPU Compute Provider Desktop App"
 authors = ["DCP <engineering@dcp.sa>"]
 edition = "2021"
