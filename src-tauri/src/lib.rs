@@ -2489,6 +2489,7 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
         if !ollama_running {
             let _serve = Command::new(&ollama_cmd())
                 .arg("serve")
+                .env("OLLAMA_HOST", "0.0.0.0")  // Listen on all interfaces for tunnel access
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .spawn()
