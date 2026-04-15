@@ -44,7 +44,8 @@
       "certificateThumbprint": null,
       "digestAlgorithm": "sha256",
       "timestampUrl": ""
-    }
+    },
+    "createUpdaterArtifacts": true
   },
   "plugins": {
     "updater": {
