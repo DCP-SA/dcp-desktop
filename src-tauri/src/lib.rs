@@ -1003,22 +1003,34 @@ fn python_cmd() -> &'static str {
     { "python3" }
     #[cfg(windows)]
     {
-        // Windows: try "python3" first, then "python", then embedded fallback
+        // Windows: verify Python actually works (not just exists)
+        // Microsoft Store stub python3.exe crashes with 0xc0000142
         static PYTHON: std::sync::OnceLock<String> = std::sync::OnceLock::new();
         let s: &String = PYTHON.get_or_init(|| {
-            if Command::new("python3").arg("--version").output()
-                .map(|o| o.status.success()).unwrap_or(false) {
-                "python3".to_string()
-            } else if Command::new("python").arg("--version").output()
-                .map(|o| o.status.success()).unwrap_or(false) {
-                "python".to_string()
-            } else if let Ok(dcp) = dcp_home() {
+            // Helper: check if python actually outputs a version string
+            let works = |cmd: &str| -> bool {
+                hide_window(Command::new(cmd).arg("--version"))
+                    .output()
+                    .map(|o| {
+                        o.status.success() &&
+                        String::from_utf8_lossy(&o.stdout).contains("Python")
+                    })
+                    .unwrap_or(false)
+            };
+            // Try embedded first (most reliable on Windows)
+            if let Ok(dcp) = dcp_home() {
                 let embedded = dcp.join("python").join("python.exe");
-                if embedded.exists() {
-                    embedded.to_string_lossy().into_owned()
-                } else {
-                    "python".to_string()
+                if embedded.exists() && works(&embedded.to_string_lossy()) {
+                    return embedded.to_string_lossy().into_owned();
                 }
+            }
+            if works("python") {
+                "python".to_string()
+            } else if works("python3") {
+                "python3".to_string()
+            } else if let Ok(dcp) = dcp_home() {
+                // Will be installed by Step 3.5
+                dcp.join("python").join("python.exe").to_string_lossy().into_owned()
             } else {
                 "python".to_string()
             }
