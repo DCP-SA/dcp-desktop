@@ -28,11 +28,12 @@ export function Account({ onNext, onBack }: AccountProps) {
         setLoading(false);
         return;
       }
-      // Try Tauri backend validation, fall back to client-side
+      // Try Tauri backend validation with 3s timeout, fall back to client-side
       try {
-        await validateApiKey(apiKey);
+        const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 3000));
+        await Promise.race([validateApiKey(apiKey), timeoutPromise]);
       } catch (_) {
-        // Tauri command may fail in dev mode — client-side validation already passed
+        // Tauri command may fail or timeout — client-side validation already passed
       }
       onNext(apiKey);
     } catch (err) {
