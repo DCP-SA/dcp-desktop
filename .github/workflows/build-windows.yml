@@ -22,34 +22,13 @@ jobs:
           workspaces: src-tauri
       - run: npm ci
       - run: npm run build
-
-      - name: Set signing key
-        shell: bash
-        run: |
-          KEY=$(echo "$SIGNING_B64" | base64 -d)
-          echo "TAURI_SIGNING_PRIVATE_KEY=$KEY" >> $GITHUB_ENV
-          echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=" >> $GITHUB_ENV
-        env:
-          SIGNING_B64: ${{ secrets.TAURI_SIGNING_KEY_B64 }}
-
       - run: npx tauri build
-
-      - name: List bundle
-        shell: pwsh
-        run: Get-ChildItem -Recurse src-tauri\target\release\bundle\nsis\ -EA SilentlyContinue | ft Length,Name
-
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ""
       - uses: actions/upload-artifact@v4
         with:
           name: dcp-provider-windows-setup
           path: src-tauri/target/release/bundle/nsis/*.exe
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: dcp-provider-windows-update
-          path: |
-            src-tauri/target/release/bundle/nsis/*.nsis.zip
-            src-tauri/target/release/bundle/nsis/*.sig
-          if-no-files-found: ignore
       - uses: actions/upload-artifact@v4
         with:
           name: dcp-provider-windows-msi
