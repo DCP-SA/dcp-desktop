@@ -278,8 +278,53 @@ fn find_nvidia_smi() -> Option<String> {
 
 #[cfg(not(target_os = "macos"))]
 fn detect_gpu_nvidia() -> Result<GpuInfo, String> {
-    let smi_path = find_nvidia_smi()
-        .ok_or("nvidia-smi not found. Is an NVIDIA GPU with drivers installed?")?;
+    // Log GPU detection diagnostics to ~/.dcp/gpu-detection.log
+    let gpu_log_path = dcp_home().ok().map(|d| d.join("gpu-detection.log"));
+    let mut gpu_log = Vec::<String>::new();
+
+    gpu_log.push(format!("[{}] GPU detection starting...", chrono_now()));
+    gpu_log.push(format!("  PATH: {}", std::env::var("PATH").unwrap_or_default()));
+
+    // Try nvidia-smi with detailed logging
+    let smi_path = find_nvidia_smi();
+    gpu_log.push(format!("  find_nvidia_smi result: {:?}", smi_path));
+
+    #[cfg(target_os = "windows")]
+    {
+        // Log which known paths exist
+        for p in &[
+            r"C:\Windows\System32\nvidia-smi.exe",
+            r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe",
+        ] {
+            gpu_log.push(format!("  {} exists: {}", p, std::path::Path::new(p).exists()));
+        }
+
+        // Try WMI as fallback GPU detection
+        let wmi = Command::new("powershell")
+            .args(["-Command", "Get-WmiObject Win32_VideoController | Select-Object Name, AdapterRAM | Format-List"])
+            .output();
+        if let Ok(o) = &wmi {
+            let wmi_out = String::from_utf8_lossy(&o.stdout);
+            gpu_log.push(format!("  WMI VideoController: {}", wmi_out.trim()));
+        }
+    }
+
+    // Write log before potentially failing
+    if let Some(ref log_path) = gpu_log_path {
+        let _ = std::fs::write(log_path, gpu_log.join("\n"));
+    }
+
+    let smi_path = smi_path
+        .ok_or_else(|| {
+            let msg = "nvidia-smi not found. Checked: PATH, System32, NVSMI, DriverStore. Check gpu-detection.log for details.".to_string();
+            if let Some(ref log_path) = gpu_log_path {
+                let _ = std::fs::OpenOptions::new().append(true).open(log_path)
+                    .and_then(|mut f| { use std::io::Write; writeln!(f, "  RESULT: FAILED — {}", msg) });
+            }
+            msg
+        })?;
+
+    gpu_log.push(format!("  Running: {} --query-gpu=...", smi_path));
 
     let output = Command::new(&smi_path)
         .args([
@@ -287,18 +332,43 @@ fn detect_gpu_nvidia() -> Result<GpuInfo, String> {
             "--format=csv,noheader,nounits",
         ])
         .output()
-        .map_err(|e| format!("nvidia-smi failed: {}", e))?;
+        .map_err(|e| {
+            let msg = format!("nvidia-smi execution failed: {}. Path: {}", e, smi_path);
+            if let Some(ref log_path) = gpu_log_path {
+                let _ = std::fs::OpenOptions::new().append(true).open(log_path)
+                    .and_then(|mut f| { use std::io::Write; writeln!(f, "  RESULT: {}", msg) });
+            }
+            msg
+        })?;
 
     if !output.status.success() {
-        return Err("nvidia-smi failed. No NVIDIA GPU detected.".to_string());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let msg = format!("nvidia-smi returned error (exit {}): {}", output.status, stderr.trim());
+        if let Some(ref log_path) = gpu_log_path {
+            let _ = std::fs::OpenOptions::new().append(true).open(log_path)
+                .and_then(|mut f| { use std::io::Write; writeln!(f, "  RESULT: {}", msg) });
+        }
+        return Err(msg);
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let line = stdout.trim();
+    gpu_log.push(format!("  nvidia-smi output: '{}'", line));
+
     let parts: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
 
     if parts.len() < 4 {
-        return Err("Could not parse nvidia-smi output.".to_string());
+        let msg = format!("Could not parse nvidia-smi output: '{}'. Expected 4 comma-separated values.", line);
+        if let Some(ref log_path) = gpu_log_path {
+            let _ = std::fs::OpenOptions::new().append(true).open(log_path)
+                .and_then(|mut f| { use std::io::Write; writeln!(f, "  RESULT: {}", msg) });
+        }
+        return Err(msg);
+    }
+
+    gpu_log.push(format!("  RESULT: OK — GPU={}, VRAM={}MB, Driver={}, CC={}", parts[0], parts[1], parts[2], parts[3]));
+    if let Some(ref log_path) = gpu_log_path {
+        let _ = std::fs::write(log_path, gpu_log.join("\n"));
     }
 
     let vram: u64 = parts[1].parse().unwrap_or(0);
@@ -625,7 +695,9 @@ async fn fetch_provider_dashboard(api_key: String) -> Result<ProviderDashboard, 
             .or_else(|| data["total_earnings_halala"].as_i64().map(|h| h as f64 / 100.0))
             .unwrap_or(0.0),
         total_jobs: data["total_jobs"].as_i64().unwrap_or(0),
-        claimable_earnings_halala: data["claimable_earnings_halala"].as_i64().unwrap_or(0),
+        claimable_earnings_halala: data["claimable_earnings_halala"].as_i64()
+            .or_else(|| data["total_earnings_halala"].as_i64())
+            .unwrap_or(0),
         today_earnings_halala: data["today_earnings_halala"].as_i64().unwrap_or(0),
         week_earnings_halala: data["week_earnings_halala"].as_i64().unwrap_or(0),
         daemon_version: data["daemon_version"].as_str().unwrap_or("").to_string(),
@@ -786,6 +858,14 @@ async fn read_config() -> Result<SavedConfig, String> {
         start_on_boot: json["start_on_boot"].as_bool().unwrap_or(true),
         served_model: json["served_model"].as_str().unwrap_or("").to_string(),
     })
+}
+
+/// Simple timestamp for logging (no chrono dependency)
+fn chrono_now() -> String {
+    let d = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("{}s", d.as_secs())
 }
 
 // ── Cross-platform Process Utilities ────────────────────────────────
@@ -1143,6 +1223,19 @@ async fn get_daemon_status(state: State<'_, DaemonManager>) -> Result<DaemonStat
         None => (status, false),
     };
 
+    // Update state if process is alive but we don't have started_at (discovered via PID file)
+    if alive && started_at.is_none() {
+        if let Ok(mut guard) = state.lock() {
+            guard.pid = actual_pid;
+            guard.status = "running".to_string();
+            if guard.started_at.is_none() {
+                // Set started_at to now — we don't know exactly when it started,
+                // but uptime will at least tick from discovery onward
+                guard.started_at = Some(std::time::Instant::now());
+            }
+        }
+    }
+
     // Update state if the process died
     if !alive && actual_pid.is_some() {
         if let Ok(mut guard) = state.lock() {
@@ -1154,9 +1247,10 @@ async fn get_daemon_status(state: State<'_, DaemonManager>) -> Result<DaemonStat
         }
     }
 
-    // Calculate uptime
+    // Calculate uptime — re-read started_at after potential update above
+    let current_started_at = state.lock().ok().and_then(|g| g.started_at);
     let uptime_seconds = if alive {
-        started_at
+        current_started_at
             .map(|s| s.elapsed().as_secs())
             .unwrap_or(0)
     } else {
@@ -2080,6 +2174,18 @@ async fn start_cloudflare_tunnel(dcp_dir: &std::path::Path, port: u16) -> Result
 async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -> Result<String, String> {
     let dcp_dir = dcp_home()?;
 
+    // Write startup log for debugging provider issues
+    let startup_log_path = dcp_dir.join("startup.log");
+    // Truncate old log on each start
+    let _ = std::fs::write(&startup_log_path, format!("[{}] === full_start_provider starting ===\n", chrono_now()));
+    macro_rules! log_startup {
+        ($($arg:tt)*) => {
+            let _ = std::fs::OpenOptions::new().append(true).create(true)
+                .open(&startup_log_path)
+                .and_then(|mut f| { use std::io::Write; writeln!(f, "[{}] {}", chrono_now(), format!($($arg)*)) });
+        };
+    }
+
     // Step 0: Kill any existing DCP processes to avoid duplicates (cross-platform)
     kill_by_name("mlx_lm.server");
     kill_by_name("dcp_daemon.py");
@@ -2096,6 +2202,8 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
     }
     // Brief pause to let ports free up
     std::thread::sleep(std::time::Duration::from_millis(500));
+
+    log_startup!("Step 0: Killed existing processes");
 
     // Step 1: Detect hardware + choose engine/model
     let is_apple_silicon;
@@ -2167,6 +2275,8 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
             "qwen3:4b".to_string()
         };
     }
+
+    log_startup!("Step 1: Hardware detected — engine={}, model={}, apple_silicon={}, mem={}GB", engine, model, is_apple_silicon, total_mem_gb);
 
     // Step 2: Install inference engine
     if engine == "mlx" {
@@ -2247,6 +2357,8 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
             }
         }
     }
+
+    log_startup!("Step 2: Engine install complete ({})", engine);
 
     // Step 3: Check if model is cached, clean old models, start inference server
     let model_cached: bool;
@@ -2467,6 +2579,8 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
         }
     }
 
+    log_startup!("Step 3: Model ready — cached={}, engine running on port {}", model_cached, if engine == "mlx" { 8000 } else { 11434 });
+
     // Step 4: Download + start the DCP daemon
     let daemon_path = dcp_dir.join("dcp_daemon.py");
     if !daemon_path.exists() {
@@ -2513,10 +2627,28 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
         guard.restart_count = 0;
     }
 
+    log_startup!("Step 4: Daemon started — PID={}", pid);
+
     // Step 5: Start Cloudflare Tunnel for NAT traversal
     // This exposes the local inference server to the internet so the backend can route jobs
     let inference_port = if engine == "mlx" { 8000 } else { 11434 };
-    let tunnel_url = start_cloudflare_tunnel(&dcp_dir, inference_port).await.unwrap_or_default();
+    let tunnel_url = match start_cloudflare_tunnel(&dcp_dir, inference_port).await {
+        Ok(url) => {
+            // Log success
+            let _ = std::fs::OpenOptions::new().append(true).create(true)
+                .open(dcp_dir.join("startup.log"))
+                .and_then(|mut f| { use std::io::Write; writeln!(f, "[tunnel] OK: {}", url) });
+            url
+        }
+        Err(e) => {
+            // Log failure — don't silently swallow
+            let _ = std::fs::OpenOptions::new().append(true).create(true)
+                .open(dcp_dir.join("startup.log"))
+                .and_then(|mut f| { use std::io::Write; writeln!(f, "[tunnel] FAILED: {}", e) });
+            // Continue without tunnel — provider will be online but unreachable for inference
+            String::new()
+        }
+    };
 
     // Step 6: Register tunnel URL with backend
     if !tunnel_url.is_empty() {
