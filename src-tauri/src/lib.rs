@@ -2765,7 +2765,46 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
         }
     }
 
+    // Upload all logs to backend (success case)
+    log_startup!("Step 7: All steps complete — uploading logs to backend");
+    upload_provider_logs(&api_key, &dcp_dir).await;
+
     Ok(format!("started:{}:{}:{}:{}", engine, model, pid, if model_cached { "cached" } else { "downloaded" }))
+}
+
+// ── Auto Log Upload ─────────────────────────────────────────────────
+
+/// Upload provider logs (startup.log, gpu-detection.log, daemon.log) to backend
+/// Called after every startup attempt, whether success or failure
+async fn upload_provider_logs(api_key: &str, dcp_dir: &std::path::Path) {
+    let mut logs = serde_json::Map::new();
+    for filename in &["startup.log", "gpu-detection.log", "daemon.log", "daemon_error.log", "cloudflared.log"] {
+        let path = dcp_dir.join(filename);
+        if path.exists() {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                // Send last 50KB of each log
+                let trimmed = if content.len() > 50000 {
+                    content[content.len()-50000..].to_string()
+                } else {
+                    content
+                };
+                logs.insert(filename.to_string(), serde_json::Value::String(trimmed));
+            }
+        }
+    }
+    if logs.is_empty() { return; }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_default();
+    let _ = client.post(format!("{}/upload-logs", API_BASE))
+        .json(&serde_json::json!({
+            "api_key": api_key,
+            "logs": logs
+        }))
+        .send()
+        .await;
 }
 
 // ── App Entry ────────────────────────────────────────────────────────
