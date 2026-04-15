@@ -33,11 +33,23 @@ jobs:
       - name: Build frontend
         run: npm run build
 
+      - name: Prepare signing key
+        shell: pwsh
+        run: |
+          $b64 = "${{ secrets.TAURI_SIGNING_KEY_B64 }}"
+          if ($b64) {
+            $decoded = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($b64))
+            [System.IO.File]::WriteAllText("$PWD\signing.key", $decoded)
+            Write-Host "Key file written ($($decoded.Length) chars)"
+            # Set for subsequent steps
+            "TAURI_SIGNING_PRIVATE_KEY<<KEYEOF" | Out-File -Append $env:GITHUB_ENV
+            $decoded | Out-File -Append $env:GITHUB_ENV -NoNewline
+            "KEYEOF" | Out-File -Append $env:GITHUB_ENV
+            "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=" | Out-File -Append $env:GITHUB_ENV
+          }
+
       - name: Build Tauri Windows installer (signed)
         run: npx tauri build
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_KEY_B64 }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
 
       - name: List all bundle files
         shell: pwsh
