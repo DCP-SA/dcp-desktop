@@ -13,58 +13,36 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 20
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+      - run: npm ci
+      - run: npm run build
 
-      - name: Install frontend dependencies
-        run: npm ci
-
-      - name: Build frontend
-        run: npm run build
-
-      - name: Prepare signing key
-        shell: pwsh
+      - name: Set signing key
+        shell: bash
         run: |
-          $b64 = "${{ secrets.TAURI_SIGNING_KEY_B64 }}"
-          if ($b64) {
-            $decoded = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($b64))
-            [System.IO.File]::WriteAllText("$PWD\signing.key", $decoded)
-            Write-Host "Key file written ($($decoded.Length) chars)"
-            # Set for subsequent steps
-            "TAURI_SIGNING_PRIVATE_KEY<<KEYEOF" | Out-File -Append $env:GITHUB_ENV
-            $decoded | Out-File -Append $env:GITHUB_ENV -NoNewline
-            "KEYEOF" | Out-File -Append $env:GITHUB_ENV
-            "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=" | Out-File -Append $env:GITHUB_ENV
-          }
+          KEY=$(echo "$SIGNING_B64" | base64 -d)
+          echo "TAURI_SIGNING_PRIVATE_KEY=$KEY" >> $GITHUB_ENV
+          echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=" >> $GITHUB_ENV
+        env:
+          SIGNING_B64: ${{ secrets.TAURI_SIGNING_KEY_B64 }}
 
-      - name: Build Tauri Windows installer (signed)
-        run: npx tauri build
+      - run: npx tauri build
 
-      - name: List all bundle files
+      - name: List bundle
         shell: pwsh
-        run: |
-          Write-Host "=== NSIS ==="
-          Get-ChildItem -Recurse src-tauri\target\release\bundle\nsis\ -ErrorAction SilentlyContinue | Format-Table Length, Name
+        run: Get-ChildItem -Recurse src-tauri\target\release\bundle\nsis\ -EA SilentlyContinue | ft Length,Name
 
-      - name: Upload NSIS installer
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: dcp-provider-windows-setup
           path: src-tauri/target/release/bundle/nsis/*.exe
-
-      - name: Upload NSIS update bundle
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: dcp-provider-windows-update
@@ -72,9 +50,7 @@ jobs:
             src-tauri/target/release/bundle/nsis/*.nsis.zip
             src-tauri/target/release/bundle/nsis/*.sig
           if-no-files-found: ignore
-
-      - name: Upload MSI installer
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: dcp-provider-windows-msi
           path: src-tauri/target/release/bundle/msi/*.msi
