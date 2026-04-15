@@ -30,10 +30,12 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      - name: Build Tauri app with signing
-        uses: tauri-apps/tauri-action@v0
+      - name: Build frontend
+        run: npm run build
+
+      - name: Build Tauri Windows installer (signed)
+        run: npx tauri build
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
 
@@ -42,8 +44,6 @@ jobs:
         run: |
           Write-Host "=== NSIS ==="
           Get-ChildItem -Recurse src-tauri\target\release\bundle\nsis\ -ErrorAction SilentlyContinue | Format-Table Length, Name
-          Write-Host "=== MSI ==="
-          Get-ChildItem -Recurse src-tauri\target\release\bundle\msi\ -ErrorAction SilentlyContinue | Format-Table Length, Name
 
       - name: Upload NSIS installer
         uses: actions/upload-artifact@v4

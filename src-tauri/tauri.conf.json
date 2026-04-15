@@ -51,7 +51,7 @@
       "endpoints": [
         "https://api.dcp.sa/api/providers/updates/{{target}}/{{current_version}}"
       ],
-      "pubkey": "RWRufGma5jvikf+4SOcA11BnicJogZVMlGUms4SQB/fGe6hacUUBHSaP"
+      "pubkey": "RWT0ebtF2q6Mt+p/qFtzcQ59Or+1YH7T6lCqVi/olOyGxf8nJtd8SWO+"
     }
   }
 }
