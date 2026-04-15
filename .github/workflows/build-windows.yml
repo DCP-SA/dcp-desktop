@@ -33,10 +33,21 @@ jobs:
       - name: Build frontend
         run: npm run build
 
-      - name: Build Tauri Windows installer (signed)
+      - name: Write signing key to file
+        shell: pwsh
+        run: |
+          $keyB64 = "${{ secrets.TAURI_SIGNING_KEY_B64 }}"
+          if ($keyB64) {
+            [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($keyB64)) | Out-File -FilePath signing-key.key -Encoding utf8NoBOM -NoNewline
+            Write-Host "Signing key written to file"
+          } else {
+            Write-Host "No signing key, building without updater"
+          }
+
+      - name: Build Tauri Windows installer
         run: npx tauri build
         env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PATH: ${{ secrets.TAURI_SIGNING_KEY_B64 && 'signing-key.key' || '' }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
 
       - name: List all bundle files
