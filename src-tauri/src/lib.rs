@@ -579,14 +579,14 @@ async fn detect_system() -> Result<SystemInfo, String> {
 
     #[cfg(target_os = "windows")]
     {
-        let os_version = Command::new("cmd")
-            .args(["/C", "ver"])
+        let os_version = hide_window(Command::new("cmd")
+            .args(["/C", "ver"]))
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_else(|_| "Windows".to_string());
 
-        let mem_output = Command::new("wmic")
-            .args(["computersystem", "get", "TotalPhysicalMemory", "/value"])
+        let mem_output = hide_window(Command::new("wmic")
+            .args(["computersystem", "get", "TotalPhysicalMemory", "/value"]))
             .output()
             .map_err(|e| format!("Failed to get memory: {}", e))?;
 
@@ -600,8 +600,8 @@ async fn detect_system() -> Result<SystemInfo, String> {
 
         let cpu_cores: u32 = num_cpus::get() as u32;
 
-        let cpu_name = Command::new("wmic")
-            .args(["cpu", "get", "Name", "/value"])
+        let cpu_name = hide_window(Command::new("wmic")
+            .args(["cpu", "get", "Name", "/value"]))
             .output()
             .map(|o| {
                 String::from_utf8_lossy(&o.stdout)
@@ -975,8 +975,8 @@ fn is_process_alive(pid: u32) -> bool {
     }
     #[cfg(windows)]
     {
-        Command::new("tasklist")
-            .args(["/FI", &format!("PID eq {}", pid), "/NH"])
+        hide_window(Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {}", pid), "/NH"]))
             .output()
             .map(|o| {
                 let out = String::from_utf8_lossy(&o.stdout);
@@ -994,7 +994,7 @@ fn kill_process_graceful(pid: u32) {
     }
     #[cfg(windows)]
     {
-        let _ = Command::new("taskkill").args(["/PID", &pid.to_string()]).output();
+        let _ = hide_window(Command::new("taskkill").args(["/PID", &pid.to_string()])).output();
     }
 }
 
@@ -1006,7 +1006,7 @@ fn kill_process_force(pid: u32) {
     }
     #[cfg(windows)]
     {
-        let _ = Command::new("taskkill").args(["/F", "/PID", &pid.to_string()]).output();
+        let _ = hide_window(Command::new("taskkill").args(["/F", "/PID", &pid.to_string()])).output();
     }
 }
 
@@ -1019,15 +1019,15 @@ fn kill_by_name(pattern: &str) {
     #[cfg(windows)]
     {
         // On Windows, find matching PIDs via wmic then taskkill
-        let output = Command::new("wmic")
-            .args(["process", "where", &format!("CommandLine like '%{}%'", pattern), "get", "ProcessId", "/value"])
+        let output = hide_window(Command::new("wmic")
+            .args(["process", "where", &format!("CommandLine like '%{}%'", pattern), "get", "ProcessId", "/value"]))
             .output();
         if let Ok(o) = output {
             let text = String::from_utf8_lossy(&o.stdout);
             for line in text.lines() {
                 if let Some(pid_str) = line.strip_prefix("ProcessId=") {
                     if let Ok(pid) = pid_str.trim().parse::<u32>() {
-                        let _ = Command::new("taskkill").args(["/F", "/PID", &pid.to_string()]).output();
+                        let _ = hide_window(Command::new("taskkill").args(["/F", "/PID", &pid.to_string()])).output();
                     }
                 }
             }
@@ -1045,7 +1045,7 @@ fn command_exists(name: &str) -> bool {
     }
     #[cfg(windows)]
     {
-        Command::new("where").arg(name).output()
+        hide_window(Command::new("where").arg(name)).output()
             .map(|o| o.status.success())
             .unwrap_or(false)
     }
@@ -1247,7 +1247,7 @@ async fn start_daemon_process(api_key: String, state: State<'_, DaemonManager>) 
         } else { (String::new(), String::new()) }
     } else { (String::new(), String::new()) };
 
-    let child = Command::new(python_cmd())
+    let child = hide_window(Command::new(python_cmd())
         .arg(&daemon_path)
         .arg("--no-watchdog")
         .arg("--key")
@@ -1257,7 +1257,7 @@ async fn start_daemon_process(api_key: String, state: State<'_, DaemonManager>) 
         .env("DCP_SERVED_MODEL", &served_model)
         .env("DCP_ENGINE", &engine_name)
         .stdout(log_file)
-        .stderr(err_file)
+        .stderr(err_file))
         .spawn()
         .map_err(|e| format!("Failed to spawn daemon: {}", e))?;
 
@@ -1448,9 +1448,9 @@ async fn check_daemon_health() -> Result<HealthReport, String> {
     {
         let smi = find_nvidia_smi();
         let nvidia = smi.as_ref().map(|path| {
-            Command::new(path)
+            hide_window(Command::new(path)
                 .arg("--query-gpu=name")
-                .arg("--format=csv,noheader")
+                .arg("--format=csv,noheader"))
                 .output()
         });
         match nvidia {
@@ -1477,7 +1477,7 @@ async fn check_daemon_health() -> Result<HealthReport, String> {
     }
 
     // 2. Python installed?
-    let python_check = Command::new(python_cmd()).arg("--version").output();
+    let python_check = hide_window(Command::new(python_cmd()).arg("--version")).output();
     match python_check {
         Ok(o) if o.status.success() => {
             let version = String::from_utf8_lossy(&o.stdout).trim().to_string();
@@ -1583,7 +1583,7 @@ async fn check_daemon_health() -> Result<HealthReport, String> {
     }
 
     // 5. Model downloaded? Check ollama list or mlx model dir
-    let model_check = Command::new(&ollama_cmd()).arg("list").output();
+    let model_check = hide_window(Command::new(&ollama_cmd()).arg("list")).output();
     match model_check {
         Ok(o) if o.status.success() => {
             let output = String::from_utf8_lossy(&o.stdout).to_string();
@@ -1665,8 +1665,8 @@ async fn check_daemon_health() -> Result<HealthReport, String> {
     });
 
     // 8. Port 8000 responding?
-    let port_check = Command::new("curl")
-        .args(["-s", "-o", "/dev/null", "-w", "%{http_code}", "--connect-timeout", "2", "http://localhost:8000/health"])
+    let port_check = hide_window(Command::new("curl")
+        .args(["-s", "-o", "/dev/null", "-w", "%{http_code}", "--connect-timeout", "2", "http://localhost:8000/health"]))
         .output();
     match port_check {
         Ok(o) if o.status.success() => {
@@ -1701,8 +1701,8 @@ async fn check_daemon_health() -> Result<HealthReport, String> {
     }
 
     // 9. Internet reachable?
-    let internet_check = Command::new("curl")
-        .args(["-s", "-o", "/dev/null", "-w", "%{http_code}", "--connect-timeout", "5", "https://api.dcp.sa/health"])
+    let internet_check = hide_window(Command::new("curl")
+        .args(["-s", "-o", "/dev/null", "-w", "%{http_code}", "--connect-timeout", "5", "https://api.dcp.sa/health"]))
         .output();
     match internet_check {
         Ok(o) if o.status.success() => {
@@ -1817,8 +1817,8 @@ async fn check_daemon_health() -> Result<HealthReport, String> {
     #[cfg(target_os = "windows")]
     {
         // Use wmic to get free disk space on C:
-        let wmic_output = Command::new("wmic")
-            .args(["logicaldisk", "where", "DeviceID='C:'", "get", "FreeSpace", "/value"])
+        let wmic_output = hide_window(Command::new("wmic")
+            .args(["logicaldisk", "where", "DeviceID='C:'", "get", "FreeSpace", "/value"]))
             .output();
         match wmic_output {
             Ok(o) if o.status.success() => {
@@ -1927,11 +1927,11 @@ async fn get_live_metrics(state: State<'_, DaemonManager>) -> Result<LiveMetrics
     {
         // NVIDIA: get real GPU metrics via nvidia-smi
         let smi_output = find_nvidia_smi().and_then(|path| {
-            Command::new(&path)
+            hide_window(Command::new(&path)
                 .args([
                     "--query-gpu=temperature.gpu,utilization.gpu,memory.used",
                     "--format=csv,noheader,nounits",
-                ])
+                ]))
                 .output()
                 .ok()
         });
