@@ -2922,6 +2922,8 @@ pub fn run() {
             let dashboard = MenuItemBuilder::with_id("dashboard", "Open Dashboard").build(app)?;
             let logs = MenuItemBuilder::with_id("logs", "View Logs").build(app)?;
             let separator3 = tauri::menu::PredefinedMenuItem::separator(app)?;
+            // L2: build a fresh separator4 instead of reusing separator3
+            let separator4 = tauri::menu::PredefinedMenuItem::separator(app)?;
             let quit = MenuItemBuilder::with_id("quit", "Quit DCP").build(app)?;
 
             let menu = MenuBuilder::new(app)
@@ -2929,7 +2931,7 @@ pub fn run() {
                     &show, &separator1,
                     &status, &earnings, &separator2,
                     &pause, &resume, &separator3,
-                    &dashboard, &logs, &separator3,
+                    &dashboard, &logs, &separator4,
                     &quit,
                 ])
                 .build()?;
