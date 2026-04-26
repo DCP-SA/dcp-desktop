@@ -953,6 +953,28 @@ fn hide_window(cmd: &mut Command) -> &mut Command {
     cmd // no-op on Unix
 }
 
+/// M11 — atomic file write: write to a temp sibling, fsync, then rename.
+/// Prevents the updater from catching a half-written daemon file when
+/// download is interrupted or the process is killed mid-write.
+fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp_path = {
+        let mut p = path.as_os_str().to_owned();
+        p.push(".part");
+        std::path::PathBuf::from(p)
+    };
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp_path, path)
+}
+
 /// G2 — spawn the daemon detached from the parent .exe so it survives a
 /// desktop UI quit / crash. On Windows: CREATE_NEW_PROCESS_GROUP combined
 /// with CREATE_NO_WINDOW. On Unix: place child in its own process group
@@ -1231,7 +1253,8 @@ async fn start_daemon_process(api_key: String, state: State<'_, DaemonManager>) 
             .await
             .map_err(|e| format!("Failed to read daemon download: {}", e))?;
 
-        std::fs::write(&daemon_path, &bytes)
+        // M11 — atomic write so we never spawn a half-downloaded daemon
+        atomic_write(&daemon_path, &bytes)
             .map_err(|e| format!("Failed to write daemon file: {}", e))?;
     }
 
@@ -2210,8 +2233,8 @@ async fn update_daemon(api_key: String) -> Result<String, String> {
         }
     }
 
-    // 4. Replace the daemon file
-    std::fs::write(&daemon_path, &new_bytes)
+    // 4. Replace the daemon file (M11 — atomic; G6 backup-before-overwrite is a separate task)
+    atomic_write(&daemon_path, &new_bytes)
         .map_err(|e| format!("Failed to write updated daemon: {}", e))?;
 
     // 5. Try to extract version from the new file
@@ -2770,8 +2793,12 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
             Ok(resp) if resp.status().is_success() => {
                 match resp.bytes().await {
                     Ok(bytes) => {
-                        let _ = std::fs::write(&daemon_path, &bytes);
-                        log_startup!("Step 4a: Daemon downloaded ({} bytes)", bytes.len());
+                        // M11 — atomic write
+                        if let Err(e) = atomic_write(&daemon_path, &bytes) {
+                            log_startup!("Step 4a: Daemon write failed: {} (using cached)", e);
+                        } else {
+                            log_startup!("Step 4a: Daemon downloaded ({} bytes)", bytes.len());
+                        }
                     }
                     Err(e) => {
                         log_startup!("Step 4a: Daemon download read failed: {} (using cached)", e);
