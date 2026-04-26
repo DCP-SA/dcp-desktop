@@ -2935,17 +2935,28 @@ pub fn run() {
                 .build()?;
 
             // Prevent window close from quitting — hide to menu bar instead
-            let win_handle = app.get_webview_window("main").unwrap();
-            let win_hide = win_handle.clone();
-            win_handle.on_window_event(move |event| {
-                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                    api.prevent_close();
-                    let _ = win_hide.hide();
-                }
-            });
+            // H9: don't panic if main window is missing (config drift); log and skip.
+            if let Some(win_handle) = app.get_webview_window("main") {
+                let win_hide = win_handle.clone();
+                win_handle.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = win_hide.hide();
+                    }
+                });
+            } else {
+                eprintln!("[setup] main webview window not found — close-to-tray disabled");
+            }
 
-            let _tray = TrayIconBuilder::new()
-                .icon(app.default_window_icon().unwrap().clone())
+            // H9: build tray without an icon if default_window_icon is unavailable
+            // rather than panicking the entire app at launch.
+            let mut tray_builder = TrayIconBuilder::new();
+            if let Some(icon) = app.default_window_icon() {
+                tray_builder = tray_builder.icon(icon.clone());
+            } else {
+                eprintln!("[setup] default_window_icon missing — tray will use platform default");
+            }
+            let _tray = tray_builder
                 .menu(&menu)
                 .tooltip("DCP Provider — Running")
                 .on_menu_event(move |app, event| {
