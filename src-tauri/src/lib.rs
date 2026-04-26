@@ -1223,10 +1223,12 @@ async fn start_daemon_process(api_key: String, state: State<'_, DaemonManager>) 
     let log_path = dcp_dir.join("daemon.log");
     let err_log_path = dcp_dir.join("daemon_error.log");
 
-    let log_file = std::fs::File::create(&log_path)
-        .map_err(|e| format!("Failed to create log file: {}", e))?;
-    let err_file = std::fs::File::create(&err_log_path)
-        .map_err(|e| format!("Failed to create error log file: {}", e))?;
+    // M7 — append, don't truncate. We lose post-mortem context exactly when we need
+    // it (immediately after a crash-restart) if these are wiped on every start.
+    let log_file = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)
+        .map_err(|e| format!("Failed to open log file: {}", e))?;
+    let err_file = std::fs::OpenOptions::new().create(true).append(true).open(&err_log_path)
+        .map_err(|e| format!("Failed to open error log file: {}", e))?;
 
     // Update state to "starting"
     {
@@ -2260,8 +2262,9 @@ async fn start_cloudflare_tunnel(dcp_dir: &std::path::Path, port: u16) -> Result
 
     // Start the tunnel
     let tunnel_log = dcp_dir.join("cloudflared.log");
-    let log_file = std::fs::File::create(&tunnel_log)
-        .map_err(|e| format!("Tunnel log create failed: {}", e))?;
+    // M7 — append, don't truncate
+    let log_file = std::fs::OpenOptions::new().create(true).append(true).open(&tunnel_log)
+        .map_err(|e| format!("Tunnel log open failed: {}", e))?;
 
     let _tunnel = hide_window(
         Command::new(&cloudflared_path)
@@ -2546,8 +2549,9 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
 
         // Start mlx_lm.server — it auto-downloads the model on first run
         let log_path = dcp_dir.join("mlx-server.log");
-        let log_file = std::fs::File::create(&log_path)
-            .map_err(|e| format!("Log create failed: {}", e))?;
+        // M7 — append, don't truncate
+        let log_file = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)
+            .map_err(|e| format!("Log open failed: {}", e))?;
         let err_file = log_file.try_clone()
             .map_err(|e| format!("Log clone failed: {}", e))?;
 
@@ -2771,10 +2775,11 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
 
     let log_path = dcp_dir.join("daemon.log");
     let err_log_path = dcp_dir.join("daemon_error.log");
-    let log_file = std::fs::File::create(&log_path)
-        .map_err(|e| format!("Log create failed: {}", e))?;
-    let err_file = std::fs::File::create(&err_log_path)
-        .map_err(|e| format!("Error log create failed: {}", e))?;
+    // M7 — append, don't truncate
+    let log_file = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)
+        .map_err(|e| format!("Log open failed: {}", e))?;
+    let err_file = std::fs::OpenOptions::new().create(true).append(true).open(&err_log_path)
+        .map_err(|e| format!("Error log open failed: {}", e))?;
 
     let child = hide_window(
         Command::new(python_cmd())
