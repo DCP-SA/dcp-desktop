@@ -3037,12 +3037,12 @@ pub fn run() {
                             let _ = open::that("https://dcp.sa/provider");
                         }
                         "logs" => {
-                            // G55/G32: daemon writes to ~/dc1-provider/logs/daemon.log
-                            // (LOG_DIR in dcp_daemon.py:178). The previous ~/.dcp/daemon.log
-                            // path was always empty/missing.
+                            // G55/G32: daemon writes to ~/dcp-provider/logs/daemon.log
+                            // (LOG_DIR in dcp_daemon.py). Daemon 4.2.0 auto-migrates the
+                            // legacy ~/dc1-provider/ home, so this path is always current.
                             let log_path = dirs::home_dir()
                                 .unwrap_or_default()
-                                .join("dc1-provider")
+                                .join("dcp-provider")
                                 .join("logs")
                                 .join("daemon.log");
                             if let Err(e) = open::that(&log_path) {
