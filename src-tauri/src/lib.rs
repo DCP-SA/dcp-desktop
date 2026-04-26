@@ -953,12 +953,10 @@ fn hide_window(cmd: &mut Command) -> &mut Command {
     cmd // no-op on Unix
 }
 
-/// Simple timestamp for logging (no chrono dependency)
+/// L4 — ISO 8601 UTC timestamp for human-facing logs
+/// (was: seconds-since-epoch as a string, hard to read in support contexts).
 fn chrono_now() -> String {
-    let d = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    format!("{}s", d.as_secs())
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 // ── Cross-platform Process Utilities ────────────────────────────────
