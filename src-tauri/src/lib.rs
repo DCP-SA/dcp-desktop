@@ -30,12 +30,6 @@ pub struct SystemInfo {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct RegistrationResult {
-    pub provider_id: String,
-    pub api_key: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DaemonConfig {
     pub run_mode: String,       // "always" | "idle" | "scheduled"
     pub gpu_usage_cap: u32,     // 50-100
@@ -632,39 +626,11 @@ async fn validate_api_key(key: String) -> Result<bool, String> {
     Ok(key.starts_with("dcp-provider-") && key.len() > 20)
 }
 
-#[tauri::command]
-async fn register_provider(email: String) -> Result<RegistrationResult, String> {
-    // In production, this would POST to the API
-    // For now, simulate registration with a deterministic key
-    if email.is_empty() || !email.contains('@') {
-        return Err("Invalid email address".to_string());
-    }
-
-    // TODO: Replace with actual HTTP call when backend is ready
-    // let client = reqwest::Client::new();
-    // let response = client
-    //     .post("https://api.dcp.sa/api/providers/register")
-    //     .json(&serde_json::json!({ "email": email }))
-    //     .send()
-    //     .await
-    //     .map_err(|e| format!("Registration failed: {}", e))?;
-
-    // Simulated response
-    let hash = format!("{:x}", md5_hash(&email));
-    Ok(RegistrationResult {
-        provider_id: format!("prov_{}", &hash[..12]),
-        api_key: format!("dcp-provider-{}", &hash[..32]),
-    })
-}
-
-/// Simple hash for demo purposes (not cryptographic)
-fn md5_hash(input: &str) -> u64 {
-    let mut hash: u64 = 5381;
-    for byte in input.bytes() {
-        hash = hash.wrapping_mul(33).wrapping_add(byte as u64);
-    }
-    hash
-}
+// H8 — register_provider removed. Registration happens through the web wizard
+// at https://dcp.sa/setup which does real backend account provisioning. The
+// previous Tauri command returned a deterministic djb2-hashed pseudo key
+// (`dcp-provider-<hash>`) that the backend rejects, leading users into a
+// broken state where every API call returns 401.
 
 #[tauri::command]
 async fn start_daemon(api_key: String, config: DaemonConfig) -> Result<String, String> {
@@ -953,12 +919,48 @@ fn hide_window(cmd: &mut Command) -> &mut Command {
     cmd // no-op on Unix
 }
 
-/// Simple timestamp for logging (no chrono dependency)
+/// M11 — atomic file write: write to a temp sibling, fsync, then rename.
+/// Prevents the updater from catching a half-written daemon file when
+/// download is interrupted or the process is killed mid-write.
+fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp_path = {
+        let mut p = path.as_os_str().to_owned();
+        p.push(".part");
+        std::path::PathBuf::from(p)
+    };
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp_path, path)
+}
+
+/// G2 — spawn the daemon detached from the parent .exe so it survives a
+/// desktop UI quit / crash. On Windows: CREATE_NEW_PROCESS_GROUP combined
+/// with CREATE_NO_WINDOW. On Unix: place child in its own process group
+/// (process_group(0)) so SIGTERM to the parent does not propagate.
+#[cfg(target_os = "windows")]
+fn detach_process(cmd: &mut Command) -> &mut Command {
+    use std::os::windows::process::CommandExt;
+    // CREATE_NO_WINDOW (0x08000000) | CREATE_NEW_PROCESS_GROUP (0x00000200)
+    cmd.creation_flags(0x08000200)
+}
+#[cfg(not(target_os = "windows"))]
+fn detach_process(cmd: &mut Command) -> &mut Command {
+    use std::os::unix::process::CommandExt;
+    cmd.process_group(0)
+}
+
+/// L4 — ISO 8601 UTC timestamp for human-facing logs
+/// (was: seconds-since-epoch as a string, hard to read in support contexts).
 fn chrono_now() -> String {
-    let d = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    format!("{}s", d.as_secs())
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 // ── Cross-platform Process Utilities ────────────────────────────────
@@ -1133,16 +1135,42 @@ fn dcp_home() -> Result<std::path::PathBuf, String> {
     Ok(dcp_dir)
 }
 
-/// Read the last N lines from a file
+/// Read the last N lines from a file.
+///
+/// M6 — seek from end and read up to TAIL_WINDOW bytes instead of slurping
+/// the whole file each poll. With 5s metric polls and verbose MLX/daemon
+/// output, the previous read_to_string approach grew O(filesize) per call
+/// and froze the dashboard after hours.
 fn tail_file(path: &std::path::Path, n: usize) -> Vec<String> {
-    match std::fs::read_to_string(path) {
-        Ok(content) => {
-            let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
-            let start = if lines.len() > n { lines.len() - n } else { 0 };
-            lines[start..].to_vec()
-        }
-        Err(_) => Vec::new(),
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL_WINDOW: u64 = 64 * 1024; // 64 KB is enough for ~hundreds of log lines
+
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    let len = match file.metadata() {
+        Ok(m) => m.len(),
+        Err(_) => return Vec::new(),
+    };
+    let read_from = len.saturating_sub(TAIL_WINDOW);
+    if file.seek(SeekFrom::Start(read_from)).is_err() {
+        return Vec::new();
     }
+    let mut buf = Vec::with_capacity(TAIL_WINDOW.min(len) as usize);
+    if file.read_to_end(&mut buf).is_err() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&buf);
+    // If we started mid-line (read_from > 0), drop the partial leading line.
+    let lines: Vec<&str> = text.lines().collect();
+    let lines = if read_from > 0 && !lines.is_empty() {
+        &lines[1..]
+    } else {
+        &lines[..]
+    };
+    let start = if lines.len() > n { lines.len() - n } else { 0 };
+    lines[start..].iter().map(|s| s.to_string()).collect()
 }
 
 /// Read PID from the PID file
@@ -1217,7 +1245,8 @@ async fn start_daemon_process(api_key: String, state: State<'_, DaemonManager>) 
             .await
             .map_err(|e| format!("Failed to read daemon download: {}", e))?;
 
-        std::fs::write(&daemon_path, &bytes)
+        // M11 — atomic write so we never spawn a half-downloaded daemon
+        atomic_write(&daemon_path, &bytes)
             .map_err(|e| format!("Failed to write daemon file: {}", e))?;
     }
 
@@ -1225,10 +1254,12 @@ async fn start_daemon_process(api_key: String, state: State<'_, DaemonManager>) 
     let log_path = dcp_dir.join("daemon.log");
     let err_log_path = dcp_dir.join("daemon_error.log");
 
-    let log_file = std::fs::File::create(&log_path)
-        .map_err(|e| format!("Failed to create log file: {}", e))?;
-    let err_file = std::fs::File::create(&err_log_path)
-        .map_err(|e| format!("Failed to create error log file: {}", e))?;
+    // M7 — append, don't truncate. We lose post-mortem context exactly when we need
+    // it (immediately after a crash-restart) if these are wiped on every start.
+    let log_file = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)
+        .map_err(|e| format!("Failed to open log file: {}", e))?;
+    let err_file = std::fs::OpenOptions::new().create(true).append(true).open(&err_log_path)
+        .map_err(|e| format!("Failed to open error log file: {}", e))?;
 
     // Update state to "starting"
     {
@@ -1247,7 +1278,8 @@ async fn start_daemon_process(api_key: String, state: State<'_, DaemonManager>) 
         } else { (String::new(), String::new()) }
     } else { (String::new(), String::new()) };
 
-    let child = hide_window(Command::new(python_cmd())
+    // G2 — detach so the daemon survives a desktop UI quit / crash.
+    let child = detach_process(Command::new(python_cmd())
         .arg(&daemon_path)
         .arg("--no-watchdog")
         .arg("--key")
@@ -2193,8 +2225,8 @@ async fn update_daemon(api_key: String) -> Result<String, String> {
         }
     }
 
-    // 4. Replace the daemon file
-    std::fs::write(&daemon_path, &new_bytes)
+    // 4. Replace the daemon file (M11 — atomic; G6 backup-before-overwrite is a separate task)
+    atomic_write(&daemon_path, &new_bytes)
         .map_err(|e| format!("Failed to write updated daemon: {}", e))?;
 
     // 5. Try to extract version from the new file
@@ -2262,8 +2294,9 @@ async fn start_cloudflare_tunnel(dcp_dir: &std::path::Path, port: u16) -> Result
 
     // Start the tunnel
     let tunnel_log = dcp_dir.join("cloudflared.log");
-    let log_file = std::fs::File::create(&tunnel_log)
-        .map_err(|e| format!("Tunnel log create failed: {}", e))?;
+    // M7 — append, don't truncate
+    let log_file = std::fs::OpenOptions::new().create(true).append(true).open(&tunnel_log)
+        .map_err(|e| format!("Tunnel log open failed: {}", e))?;
 
     let _tunnel = hide_window(
         Command::new(&cloudflared_path)
@@ -2548,8 +2581,9 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
 
         // Start mlx_lm.server — it auto-downloads the model on first run
         let log_path = dcp_dir.join("mlx-server.log");
-        let log_file = std::fs::File::create(&log_path)
-            .map_err(|e| format!("Log create failed: {}", e))?;
+        // M7 — append, don't truncate
+        let log_file = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)
+            .map_err(|e| format!("Log open failed: {}", e))?;
         let err_file = log_file.try_clone()
             .map_err(|e| format!("Log clone failed: {}", e))?;
 
@@ -2562,11 +2596,14 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
 
         // Write model info to config
         let config_path = dcp_dir.join("config.json");
+        // M3 — log config-save failures so a corrupt config is visible
         if let Ok(config_str) = std::fs::read_to_string(&config_path) {
             if let Ok(mut config) = serde_json::from_str::<serde_json::Value>(&config_str) {
                 config["served_model"] = serde_json::Value::String(model.clone());
                 config["engine"] = serde_json::Value::String(engine.clone());
-                let _ = std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap_or_default());
+                if let Err(e) = std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap_or_default()) {
+                    log_startup!("Failed to update config.json with model/engine: {}", e);
+                }
             }
         } else {
             // Create config if it doesn't exist
@@ -2575,7 +2612,9 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
                 "served_model": model,
                 "engine": engine,
             });
-            let _ = std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap_or_default());
+            if let Err(e) = std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap_or_default()) {
+                log_startup!("Failed to create config.json: {}", e);
+            }
         }
     } else {
         // Ollama: start serve + pull model
@@ -2751,8 +2790,12 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
             Ok(resp) if resp.status().is_success() => {
                 match resp.bytes().await {
                     Ok(bytes) => {
-                        let _ = std::fs::write(&daemon_path, &bytes);
-                        log_startup!("Step 4a: Daemon downloaded ({} bytes)", bytes.len());
+                        // M11 — atomic write
+                        if let Err(e) = atomic_write(&daemon_path, &bytes) {
+                            log_startup!("Step 4a: Daemon write failed: {} (using cached)", e);
+                        } else {
+                            log_startup!("Step 4a: Daemon downloaded ({} bytes)", bytes.len());
+                        }
                     }
                     Err(e) => {
                         log_startup!("Step 4a: Daemon download read failed: {} (using cached)", e);
@@ -2773,12 +2816,14 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
 
     let log_path = dcp_dir.join("daemon.log");
     let err_log_path = dcp_dir.join("daemon_error.log");
-    let log_file = std::fs::File::create(&log_path)
-        .map_err(|e| format!("Log create failed: {}", e))?;
-    let err_file = std::fs::File::create(&err_log_path)
-        .map_err(|e| format!("Error log create failed: {}", e))?;
+    // M7 — append, don't truncate
+    let log_file = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)
+        .map_err(|e| format!("Log open failed: {}", e))?;
+    let err_file = std::fs::OpenOptions::new().create(true).append(true).open(&err_log_path)
+        .map_err(|e| format!("Error log open failed: {}", e))?;
 
-    let child = hide_window(
+    // G2 — detach so the daemon survives a desktop UI quit / crash.
+    let child = detach_process(
         Command::new(python_cmd())
             .arg(&daemon_path)
             .arg("--no-watchdog")
@@ -2793,7 +2838,10 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
         .map_err(|e| format!("Daemon spawn failed: {}", e))?;
 
     let pid = child.id();
-    let _ = write_pid_file(pid);
+    // M3 — surface PID-file failures: without the file we can't kill/restart the daemon
+    if let Err(e) = write_pid_file(pid) {
+        log_startup!("Failed to write daemon PID file: {}", e);
+    }
 
     {
         let mut guard = state.lock().map_err(|e| format!("Lock: {}", e))?;
@@ -2829,20 +2877,36 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
     // Step 6: Register tunnel URL with backend
     if !tunnel_url.is_empty() {
         let client = reqwest::Client::new();
-        let _ = client.post(format!("{}/endpoint", API_BASE))
+        // M3 — log if tunnel registration fails. If the backend doesn't have
+        // our tunnel URL, we never receive jobs; this used to fail silently.
+        match client.post(format!("{}/endpoint", API_BASE))
             .json(&serde_json::json!({
                 "key": api_key,
                 "vllm_endpoint_url": tunnel_url
             }))
             .send()
-            .await;
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                log_startup!("Step 6: Tunnel URL registered with backend");
+            }
+            Ok(resp) => {
+                log_startup!("Step 6: Tunnel registration HTTP {}", resp.status());
+            }
+            Err(e) => {
+                log_startup!("Step 6: Tunnel registration network error: {}", e);
+            }
+        }
 
         // Save tunnel URL to config
         let config_path = dcp_dir.join("config.json");
         if let Ok(content) = std::fs::read_to_string(&config_path) {
             if let Ok(mut config) = serde_json::from_str::<serde_json::Value>(&content) {
                 config["tunnel_url"] = serde_json::Value::String(tunnel_url.clone());
-                let _ = std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap_or_default());
+                // M3 — log config-save failures
+                if let Err(e) = std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap_or_default()) {
+                    log_startup!("Step 6: Failed to save tunnel URL to config: {}", e);
+                }
             }
         }
     }
@@ -2922,6 +2986,8 @@ pub fn run() {
             let dashboard = MenuItemBuilder::with_id("dashboard", "Open Dashboard").build(app)?;
             let logs = MenuItemBuilder::with_id("logs", "View Logs").build(app)?;
             let separator3 = tauri::menu::PredefinedMenuItem::separator(app)?;
+            // L2: build a fresh separator4 instead of reusing separator3
+            let separator4 = tauri::menu::PredefinedMenuItem::separator(app)?;
             let quit = MenuItemBuilder::with_id("quit", "Quit DCP").build(app)?;
 
             let menu = MenuBuilder::new(app)
@@ -2929,23 +2995,34 @@ pub fn run() {
                     &show, &separator1,
                     &status, &earnings, &separator2,
                     &pause, &resume, &separator3,
-                    &dashboard, &logs, &separator3,
+                    &dashboard, &logs, &separator4,
                     &quit,
                 ])
                 .build()?;
 
             // Prevent window close from quitting — hide to menu bar instead
-            let win_handle = app.get_webview_window("main").unwrap();
-            let win_hide = win_handle.clone();
-            win_handle.on_window_event(move |event| {
-                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                    api.prevent_close();
-                    let _ = win_hide.hide();
-                }
-            });
+            // H9: don't panic if main window is missing (config drift); log and skip.
+            if let Some(win_handle) = app.get_webview_window("main") {
+                let win_hide = win_handle.clone();
+                win_handle.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = win_hide.hide();
+                    }
+                });
+            } else {
+                eprintln!("[setup] main webview window not found — close-to-tray disabled");
+            }
 
-            let _tray = TrayIconBuilder::new()
-                .icon(app.default_window_icon().unwrap().clone())
+            // H9: build tray without an icon if default_window_icon is unavailable
+            // rather than panicking the entire app at launch.
+            let mut tray_builder = TrayIconBuilder::new();
+            if let Some(icon) = app.default_window_icon() {
+                tray_builder = tray_builder.icon(icon.clone());
+            } else {
+                eprintln!("[setup] default_window_icon missing — tray will use platform default");
+            }
+            let _tray = tray_builder
                 .menu(&menu)
                 .tooltip("DCP Provider — Running")
                 .on_menu_event(move |app, event| {
@@ -2960,11 +3037,17 @@ pub fn run() {
                             let _ = open::that("https://dcp.sa/provider");
                         }
                         "logs" => {
+                            // G55/G32: daemon writes to ~/dcp-provider/logs/daemon.log
+                            // (LOG_DIR in dcp_daemon.py). Daemon 4.2.0 auto-migrates the
+                            // legacy ~/dc1-provider/ home, so this path is always current.
                             let log_path = dirs::home_dir()
                                 .unwrap_or_default()
-                                .join(".dcp")
+                                .join("dcp-provider")
+                                .join("logs")
                                 .join("daemon.log");
-                            let _ = open::that(log_path);
+                            if let Err(e) = open::that(&log_path) {
+                                eprintln!("Failed to open log file {:?}: {}", log_path, e);
+                            }
                         }
                         "quit" => {
                             app.exit(0);
@@ -2993,7 +3076,6 @@ pub fn run() {
             detect_gpu,
             detect_system,
             validate_api_key,
-            register_provider,
             start_daemon,
             get_estimated_earnings,
             check_setup_complete,
