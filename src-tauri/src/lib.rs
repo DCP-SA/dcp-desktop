@@ -953,6 +953,22 @@ fn hide_window(cmd: &mut Command) -> &mut Command {
     cmd // no-op on Unix
 }
 
+/// G2 — spawn the daemon detached from the parent .exe so it survives a
+/// desktop UI quit / crash. On Windows: CREATE_NEW_PROCESS_GROUP combined
+/// with CREATE_NO_WINDOW. On Unix: place child in its own process group
+/// (process_group(0)) so SIGTERM to the parent does not propagate.
+#[cfg(target_os = "windows")]
+fn detach_process(cmd: &mut Command) -> &mut Command {
+    use std::os::windows::process::CommandExt;
+    // CREATE_NO_WINDOW (0x08000000) | CREATE_NEW_PROCESS_GROUP (0x00000200)
+    cmd.creation_flags(0x08000200)
+}
+#[cfg(not(target_os = "windows"))]
+fn detach_process(cmd: &mut Command) -> &mut Command {
+    use std::os::unix::process::CommandExt;
+    cmd.process_group(0)
+}
+
 /// L4 — ISO 8601 UTC timestamp for human-facing logs
 /// (was: seconds-since-epoch as a string, hard to read in support contexts).
 fn chrono_now() -> String {
@@ -1247,7 +1263,8 @@ async fn start_daemon_process(api_key: String, state: State<'_, DaemonManager>) 
         } else { (String::new(), String::new()) }
     } else { (String::new(), String::new()) };
 
-    let child = hide_window(Command::new(python_cmd())
+    // G2 — detach so the daemon survives a desktop UI quit / crash.
+    let child = detach_process(Command::new(python_cmd())
         .arg(&daemon_path)
         .arg("--no-watchdog")
         .arg("--key")
@@ -2781,7 +2798,8 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
     let err_file = std::fs::OpenOptions::new().create(true).append(true).open(&err_log_path)
         .map_err(|e| format!("Error log open failed: {}", e))?;
 
-    let child = hide_window(
+    // G2 — detach so the daemon survives a desktop UI quit / crash.
+    let child = detach_process(
         Command::new(python_cmd())
             .arg(&daemon_path)
             .arg("--no-watchdog")
