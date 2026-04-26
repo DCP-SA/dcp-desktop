@@ -30,12 +30,6 @@ pub struct SystemInfo {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct RegistrationResult {
-    pub provider_id: String,
-    pub api_key: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DaemonConfig {
     pub run_mode: String,       // "always" | "idle" | "scheduled"
     pub gpu_usage_cap: u32,     // 50-100
@@ -632,39 +626,11 @@ async fn validate_api_key(key: String) -> Result<bool, String> {
     Ok(key.starts_with("dcp-provider-") && key.len() > 20)
 }
 
-#[tauri::command]
-async fn register_provider(email: String) -> Result<RegistrationResult, String> {
-    // In production, this would POST to the API
-    // For now, simulate registration with a deterministic key
-    if email.is_empty() || !email.contains('@') {
-        return Err("Invalid email address".to_string());
-    }
-
-    // TODO: Replace with actual HTTP call when backend is ready
-    // let client = reqwest::Client::new();
-    // let response = client
-    //     .post("https://api.dcp.sa/api/providers/register")
-    //     .json(&serde_json::json!({ "email": email }))
-    //     .send()
-    //     .await
-    //     .map_err(|e| format!("Registration failed: {}", e))?;
-
-    // Simulated response
-    let hash = format!("{:x}", md5_hash(&email));
-    Ok(RegistrationResult {
-        provider_id: format!("prov_{}", &hash[..12]),
-        api_key: format!("dcp-provider-{}", &hash[..32]),
-    })
-}
-
-/// Simple hash for demo purposes (not cryptographic)
-fn md5_hash(input: &str) -> u64 {
-    let mut hash: u64 = 5381;
-    for byte in input.bytes() {
-        hash = hash.wrapping_mul(33).wrapping_add(byte as u64);
-    }
-    hash
-}
+// H8 — register_provider removed. Registration happens through the web wizard
+// at https://dcp.sa/setup which does real backend account provisioning. The
+// previous Tauri command returned a deterministic djb2-hashed pseudo key
+// (`dcp-provider-<hash>`) that the backend rejects, leading users into a
+// broken state where every API call returns 401.
 
 #[tauri::command]
 async fn start_daemon(api_key: String, config: DaemonConfig) -> Result<String, String> {
@@ -3086,7 +3052,6 @@ pub fn run() {
             detect_gpu,
             detect_system,
             validate_api_key,
-            register_provider,
             start_daemon,
             get_estimated_earnings,
             check_setup_complete,

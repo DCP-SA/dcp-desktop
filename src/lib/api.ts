@@ -20,11 +20,6 @@ export interface SystemInfo {
   arch: string;
 }
 
-export interface RegistrationResult {
-  provider_id: string;
-  api_key: string;
-}
-
 export interface DaemonConfig {
   run_mode: "always" | "idle" | "scheduled";
   gpu_usage_cap: number;
@@ -46,11 +41,8 @@ export async function validateApiKey(key: string): Promise<boolean> {
   return invoke<boolean>("validate_api_key", { key });
 }
 
-export async function registerProvider(
-  email: string
-): Promise<RegistrationResult> {
-  return invoke<RegistrationResult>("register_provider", { email });
-}
+// H8 — registerProvider removed. New providers register via the web wizard
+// at https://dcp.sa/setup; the desktop app only accepts an existing API key.
 
 export async function startDaemon(
   apiKey: string,
