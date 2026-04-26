@@ -1169,16 +1169,42 @@ fn dcp_home() -> Result<std::path::PathBuf, String> {
     Ok(dcp_dir)
 }
 
-/// Read the last N lines from a file
+/// Read the last N lines from a file.
+///
+/// M6 — seek from end and read up to TAIL_WINDOW bytes instead of slurping
+/// the whole file each poll. With 5s metric polls and verbose MLX/daemon
+/// output, the previous read_to_string approach grew O(filesize) per call
+/// and froze the dashboard after hours.
 fn tail_file(path: &std::path::Path, n: usize) -> Vec<String> {
-    match std::fs::read_to_string(path) {
-        Ok(content) => {
-            let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
-            let start = if lines.len() > n { lines.len() - n } else { 0 };
-            lines[start..].to_vec()
-        }
-        Err(_) => Vec::new(),
+    use std::io::{Read, Seek, SeekFrom};
+    const TAIL_WINDOW: u64 = 64 * 1024; // 64 KB is enough for ~hundreds of log lines
+
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    let len = match file.metadata() {
+        Ok(m) => m.len(),
+        Err(_) => return Vec::new(),
+    };
+    let read_from = len.saturating_sub(TAIL_WINDOW);
+    if file.seek(SeekFrom::Start(read_from)).is_err() {
+        return Vec::new();
     }
+    let mut buf = Vec::with_capacity(TAIL_WINDOW.min(len) as usize);
+    if file.read_to_end(&mut buf).is_err() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&buf);
+    // If we started mid-line (read_from > 0), drop the partial leading line.
+    let lines: Vec<&str> = text.lines().collect();
+    let lines = if read_from > 0 && !lines.is_empty() {
+        &lines[1..]
+    } else {
+        &lines[..]
+    };
+    let start = if lines.len() > n { lines.len() - n } else { 0 };
+    lines[start..].iter().map(|s| s.to_string()).collect()
 }
 
 /// Read PID from the PID file
