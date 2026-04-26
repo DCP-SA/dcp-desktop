@@ -2596,11 +2596,14 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
 
         // Write model info to config
         let config_path = dcp_dir.join("config.json");
+        // M3 — log config-save failures so a corrupt config is visible
         if let Ok(config_str) = std::fs::read_to_string(&config_path) {
             if let Ok(mut config) = serde_json::from_str::<serde_json::Value>(&config_str) {
                 config["served_model"] = serde_json::Value::String(model.clone());
                 config["engine"] = serde_json::Value::String(engine.clone());
-                let _ = std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap_or_default());
+                if let Err(e) = std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap_or_default()) {
+                    log_startup!("Failed to update config.json with model/engine: {}", e);
+                }
             }
         } else {
             // Create config if it doesn't exist
@@ -2609,7 +2612,9 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
                 "served_model": model,
                 "engine": engine,
             });
-            let _ = std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap_or_default());
+            if let Err(e) = std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap_or_default()) {
+                log_startup!("Failed to create config.json: {}", e);
+            }
         }
     } else {
         // Ollama: start serve + pull model
@@ -2833,7 +2838,10 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
         .map_err(|e| format!("Daemon spawn failed: {}", e))?;
 
     let pid = child.id();
-    let _ = write_pid_file(pid);
+    // M3 — surface PID-file failures: without the file we can't kill/restart the daemon
+    if let Err(e) = write_pid_file(pid) {
+        log_startup!("Failed to write daemon PID file: {}", e);
+    }
 
     {
         let mut guard = state.lock().map_err(|e| format!("Lock: {}", e))?;
@@ -2869,20 +2877,36 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
     // Step 6: Register tunnel URL with backend
     if !tunnel_url.is_empty() {
         let client = reqwest::Client::new();
-        let _ = client.post(format!("{}/endpoint", API_BASE))
+        // M3 — log if tunnel registration fails. If the backend doesn't have
+        // our tunnel URL, we never receive jobs; this used to fail silently.
+        match client.post(format!("{}/endpoint", API_BASE))
             .json(&serde_json::json!({
                 "key": api_key,
                 "vllm_endpoint_url": tunnel_url
             }))
             .send()
-            .await;
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                log_startup!("Step 6: Tunnel URL registered with backend");
+            }
+            Ok(resp) => {
+                log_startup!("Step 6: Tunnel registration HTTP {}", resp.status());
+            }
+            Err(e) => {
+                log_startup!("Step 6: Tunnel registration network error: {}", e);
+            }
+        }
 
         // Save tunnel URL to config
         let config_path = dcp_dir.join("config.json");
         if let Ok(content) = std::fs::read_to_string(&config_path) {
             if let Ok(mut config) = serde_json::from_str::<serde_json::Value>(&content) {
                 config["tunnel_url"] = serde_json::Value::String(tunnel_url.clone());
-                let _ = std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap_or_default());
+                // M3 — log config-save failures
+                if let Err(e) = std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap_or_default()) {
+                    log_startup!("Step 6: Failed to save tunnel URL to config: {}", e);
+                }
             }
         }
     }
