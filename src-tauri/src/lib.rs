@@ -2960,11 +2960,17 @@ pub fn run() {
                             let _ = open::that("https://dcp.sa/provider");
                         }
                         "logs" => {
+                            // G55/G32: daemon writes to ~/dc1-provider/logs/daemon.log
+                            // (LOG_DIR in dcp_daemon.py:178). The previous ~/.dcp/daemon.log
+                            // path was always empty/missing.
                             let log_path = dirs::home_dir()
                                 .unwrap_or_default()
-                                .join(".dcp")
+                                .join("dc1-provider")
+                                .join("logs")
                                 .join("daemon.log");
-                            let _ = open::that(log_path);
+                            if let Err(e) = open::that(&log_path) {
+                                eprintln!("Failed to open log file {:?}: {}", log_path, e);
+                            }
                         }
                         "quit" => {
                             app.exit(0);
