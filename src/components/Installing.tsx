@@ -39,7 +39,12 @@ export function Installing({ apiKey, config, gpu, onComplete }: InstallingProps)
     let cancelled = false;
 
     async function runInstall() {
-      const isApple = gpu?.is_apple_silicon ?? false;
+      // Defensive: if gpu detection failed, fall back to UA sniff so we don't
+      // mislabel Windows/Linux as MLX. Only treat as Apple Silicon when the
+      // backend says so AND the UA agrees we're on a Mac.
+      const uaIsMac =
+        typeof navigator !== "undefined" && /Mac/i.test(navigator.platform || "");
+      const isApple = (gpu?.is_apple_silicon ?? false) && uaIsMac;
       const engineName = isApple ? "MLX" : "Ollama";
       const vramMb = gpu?.vram_mb ?? 0;
       const vramGb = Math.round(vramMb / 1024);
@@ -69,14 +74,18 @@ export function Installing({ apiKey, config, gpu, onComplete }: InstallingProps)
         // Step 1: Hardware (already done)
         markStep(0, "done", `${gpu?.name ?? "Unknown"} • ${vramGb} GB`);
 
-        // Step 2: Install engine
+        // Step 2: Install engine — fail loudly if the engine install errors.
+        // Previously this swallowed errors and marked the step "done" anyway,
+        // which is why wizards "succeeded" with no Ollama installed.
         markStep(1, "active", `Installing ${engineName}...`);
         try {
           await installEngine();
           markStep(1, "done", `${engineName} ready`);
         } catch (e) {
-          // Might already be installed
-          markStep(1, "done", `${engineName} available`);
+          const errMsg = String(e);
+          markStep(1, "error", errMsg);
+          setError(errMsg);
+          return;
         }
         if (cancelled) return;
 
