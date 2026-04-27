@@ -678,7 +678,10 @@ export function Dashboard() {
         // Step 2: Will become active during full_start_provider
         await new Promise((r) => setTimeout(r, 600));
         if (startupCancelledRef.current) return;
-        updateStep(1, { status: "done", detail: "MLX installed" });
+        updateStep(1, {
+          status: "done",
+          detail: gpuStatus.memory.includes("unified") ? "MLX installed" : "Ollama installed",
+        });
         updateStep(2, { status: "active", detail: "Preparing model download..." });
 
         // Step 3-5: Call full_start_provider which handles everything
