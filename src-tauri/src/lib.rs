@@ -96,6 +96,16 @@ pub struct LiveMetrics {
 
 const API_BASE: &str = "https://api.dcp.sa/api/providers";
 
+const MODEL_METADATA: &[(&str, &str, f64)] = &[
+    ("qwen3:30b-a3b", "Qwen3 30B-A3B", 17.7),
+    ("qwen3:8b", "Qwen3 8B", 5.2),
+    ("qwen3:4b", "Qwen3 4B", 2.5),
+    ("mistral:7b", "Mistral 7B", 4.1),
+    ("mlx-community/Qwen3-30B-A3B-4bit", "Qwen3 30B-A3B (MLX)", 16.4),
+    ("mlx-community/Qwen3-8B-4bit", "Qwen3 8B (MLX)", 4.5),
+    ("mlx-community/Qwen3-4B-4bit", "Qwen3 4B (MLX)", 2.3),
+];
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ProviderDashboard {
     pub provider_id: i64,
@@ -3342,6 +3352,65 @@ async fn upload_provider_logs(api_key: &str, dcp_dir: &std::path::Path) {
         .await;
 }
 
+// ── Wizard Helper Commands ───────────────────────────────────────────
+
+#[derive(serde::Serialize)]
+struct ModelMetadata {
+    display_name: String,
+    size_gb: Option<f64>,
+}
+
+#[tauri::command]
+fn get_model_metadata(model_id: String) -> ModelMetadata {
+    for (id, name, size) in MODEL_METADATA {
+        if *id == model_id {
+            return ModelMetadata {
+                display_name: name.to_string(),
+                size_gb: Some(*size),
+            };
+        }
+    }
+    ModelMetadata { display_name: model_id, size_gb: None }
+}
+
+#[derive(serde::Serialize)]
+struct SpeedProbeResult {
+    mbps: Option<f64>,
+    sample_bytes: u64,
+    elapsed_ms: u64,
+}
+
+#[tauri::command]
+async fn pre_install_speed_probe() -> SpeedProbeResult {
+    let url = "https://github.com/ollama/ollama/releases/latest/download/OllamaSetup.exe";
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return SpeedProbeResult { mbps: None, sample_bytes: 0, elapsed_ms: 0 },
+    };
+
+    let started = std::time::Instant::now();
+    let resp = client.get(url).header("Range", "bytes=0-10485759").send().await;
+    let resp = match resp {
+        Ok(r) => r,
+        Err(_) => return SpeedProbeResult { mbps: None, sample_bytes: 0, elapsed_ms: started.elapsed().as_millis() as u64 },
+    };
+    let bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(_) => return SpeedProbeResult { mbps: None, sample_bytes: 0, elapsed_ms: started.elapsed().as_millis() as u64 },
+    };
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let sample_bytes = bytes.len() as u64;
+    let mbps = if elapsed_ms > 0 {
+        Some((sample_bytes as f64 * 8.0) / (elapsed_ms as f64 * 1000.0)) // (bytes*8 bits) / (ms * 1000) = Mbps
+    } else {
+        None
+    };
+    SpeedProbeResult { mbps, sample_bytes, elapsed_ms }
+}
+
 // ── App Entry ────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -3538,6 +3607,8 @@ pub fn run() {
             update_daemon,
             rollback_daemon,
             full_start_provider,
+            get_model_metadata,
+            pre_install_speed_probe,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
