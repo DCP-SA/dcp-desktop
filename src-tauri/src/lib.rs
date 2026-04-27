@@ -1053,21 +1053,64 @@ fn command_exists(name: &str) -> bool {
     }
 }
 
-/// Find the Ollama executable (checks PATH + known Windows install path)
+/// Find the Ollama executable (checks PATH + custom-path Windows installs).
+///
+/// Lookup order on Windows:
+///   1. PATH (via `command_exists`).
+///   2. `where.exe ollama` — picks up custom-path installs that put ollama.exe
+///      somewhere not in our hard-coded list but still reachable on PATH.
+///   3. Registry `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\Ollama`
+///      → `InstallLocation` (Inno Setup writes this even for non-default dirs).
+///   4. `%LOCALAPPDATA%\Programs\Ollama\ollama.exe` (default user install).
+///   5. `C:\Program Files\Ollama\ollama.exe`.
+///   6. `C:\Program Files (x86)\Ollama\ollama.exe`.
+///   7. Fallback to the bare string `"ollama"` so the caller fails with a
+///      clear "command not found" error rather than a path-shaped one.
 fn ollama_cmd() -> String {
     if command_exists("ollama") {
         return "ollama".to_string();
     }
     #[cfg(target_os = "windows")]
     {
-        // Ollama Inno Setup installs to %LOCALAPPDATA%\Programs\Ollama
+        // (2) where.exe — finds custom-path installs that registered with PATH.
+        if let Ok(out) = hide_window(Command::new("where.exe").arg("ollama")).output() {
+            if out.status.success() {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                if let Some(first) = stdout.lines().next() {
+                    let trimmed = first.trim();
+                    if !trimmed.is_empty() && std::path::Path::new(trimmed).exists() {
+                        return trimmed.to_string();
+                    }
+                }
+            }
+        }
+
+        // (3) Registry InstallLocation under the Uninstall key.
+        {
+            use winreg::enums::HKEY_CURRENT_USER;
+            use winreg::RegKey;
+            let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+            if let Ok(key) = hkcu.open_subkey(
+                r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Ollama",
+            ) {
+                if let Ok(install_location) = key.get_value::<String, _>("InstallLocation") {
+                    let candidate = std::path::PathBuf::from(install_location.trim())
+                        .join("ollama.exe");
+                    if candidate.exists() {
+                        return candidate.to_string_lossy().into_owned();
+                    }
+                }
+            }
+        }
+
+        // (4) Default Inno Setup user install path.
         if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
             let ollama_path = format!(r"{}\Programs\Ollama\ollama.exe", local_app_data);
             if std::path::Path::new(&ollama_path).exists() {
                 return ollama_path;
             }
         }
-        // Also check Program Files
+        // (5) + (6) Program Files fallbacks.
         let alt_paths = [
             r"C:\Program Files\Ollama\ollama.exe",
             r"C:\Program Files (x86)\Ollama\ollama.exe",
@@ -2491,57 +2534,155 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
             }
         }
     } else {
-        // Ollama — cross-platform install
-        #[allow(unused_mut)]
-        let mut ollama_installed = command_exists("ollama");
+        // Ollama — cross-platform install with engine-gate semantics.
+        //
+        // Pre-flight: if Ollama is already serving on :11434 we skip the
+        // entire install path. This prevents re-running the 1.85 GB installer
+        // every time the wizard launches and is the cheapest way to detect
+        // "already installed and running" reliably on Windows.
+        let ollama_serving = {
+            let probe = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(2))
+                .build()
+                .unwrap_or_default();
+            probe.get("http://127.0.0.1:11434/api/version")
+                .send()
+                .await
+                .map(|r| r.status().is_success())
+                .unwrap_or(false)
+        };
 
-        // Windows fallback: check known install path if not found in PATH
-        #[cfg(windows)]
-        if !ollama_installed {
-            if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-                let ollama_path = std::path::PathBuf::from(local_app_data)
-                    .join("Programs")
-                    .join("Ollama")
-                    .join("ollama.exe");
-                if ollama_path.exists() {
-                    ollama_installed = true;
-                }
-            }
-        }
+        if ollama_serving {
+            log_startup!("Step 2: Ollama already running on :11434, skipping install");
+        } else {
+            #[allow(unused_mut)]
+            let mut ollama_installed = command_exists("ollama");
 
-        if !ollama_installed {
-            #[cfg(unix)]
-            {
-                let install = Command::new("sh")
-                    .args(["-c", "curl -fsSL https://ollama.com/install.sh | sh"])
-                    .output()
-                    .map_err(|e| format!("Ollama install failed: {}", e))?;
-                if !install.status.success() {
-                    return Err("Failed to install Ollama. Install manually from https://ollama.com".to_string());
-                }
-            }
+            // Windows fallback: check known install path if not found in PATH
             #[cfg(windows)]
-            {
-                // Download OllamaSetup.exe directly — works on all Windows 10+ without winget
-                let installer_path = dcp_home()?.join("OllamaSetup.exe");
-                let response = reqwest::get("https://github.com/ollama/ollama/releases/latest/download/OllamaSetup.exe")
-                    .await
-                    .map_err(|e| format!("Failed to download Ollama installer: {}", e))?;
-                let bytes = response.bytes().await
-                    .map_err(|e| format!("Failed to read Ollama installer bytes: {}", e))?;
-                std::fs::write(&installer_path, &bytes)
-                    .map_err(|e| format!("Failed to save OllamaSetup.exe: {}", e))?;
+            if !ollama_installed {
+                if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
+                    let ollama_path = std::path::PathBuf::from(local_app_data)
+                        .join("Programs")
+                        .join("Ollama")
+                        .join("ollama.exe");
+                    if ollama_path.exists() {
+                        ollama_installed = true;
+                    }
+                }
+            }
 
-                let install = Command::new(&installer_path)
-                    .args(["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"])
-                    .output()
-                    .map_err(|e| format!("Failed to run Ollama installer: {}", e))?;
+            if !ollama_installed {
+                #[cfg(unix)]
+                {
+                    let install = Command::new("sh")
+                        .args(["-c", "curl -fsSL https://ollama.com/install.sh | sh"])
+                        .output()
+                        .map_err(|e| format!("Ollama install failed: {}", e))?;
+                    if !install.status.success() {
+                        return Err("Failed to install Ollama. Install manually from https://ollama.com".to_string());
+                    }
+                }
+                #[cfg(windows)]
+                {
+                    // Reuse a previously-downloaded OllamaSetup.exe if it's
+                    // present and at least 1 GB on disk (the real installer
+                    // is ~1.85 GB; anything smaller is a partial / failed
+                    // download we should re-fetch). Also tolerate a renamed
+                    // legacy copy via case-insensitive *[Ss]etup*.exe glob.
+                    let dcp_dir = dcp_home()?;
+                    let installer_path = dcp_dir.join("OllamaSetup.exe");
+                    const MIN_INSTALLER_BYTES: u64 = 1_000_000_000; // 1 GB
 
-                // Clean up installer
-                let _ = std::fs::remove_file(&installer_path);
+                    let mut have_cached_installer = installer_path
+                        .metadata()
+                        .map(|m| m.len() >= MIN_INSTALLER_BYTES)
+                        .unwrap_or(false);
 
-                if !install.status.success() {
-                    return Err("Failed to install Ollama. Install manually from https://ollama.com/download/windows".to_string());
+                    // If the canonical name is missing/short, scan dcp_dir
+                    // for any *Setup*.exe / *setup*.exe big enough to be it.
+                    let mut chosen_installer = installer_path.clone();
+                    if !have_cached_installer {
+                        if let Ok(entries) = std::fs::read_dir(&dcp_dir) {
+                            for entry in entries.flatten() {
+                                let p = entry.path();
+                                let name = p
+                                    .file_name()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or("")
+                                    .to_ascii_lowercase();
+                                if name.ends_with(".exe") && name.contains("setup") {
+                                    if let Ok(meta) = entry.metadata() {
+                                        if meta.len() >= MIN_INSTALLER_BYTES {
+                                            chosen_installer = p;
+                                            have_cached_installer = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if have_cached_installer {
+                        log_startup!(
+                            "Step 2: Reusing existing Ollama installer at {}",
+                            chosen_installer.display()
+                        );
+                    } else {
+                        // Download OllamaSetup.exe directly — works on all
+                        // Windows 10+ without winget.
+                        log_startup!("Step 2: Downloading OllamaSetup.exe (~1.85 GB)");
+                        let response = reqwest::get("https://github.com/ollama/ollama/releases/latest/download/OllamaSetup.exe")
+                            .await
+                            .map_err(|e| format!("Failed to download Ollama installer: {}", e))?;
+                        let bytes = response.bytes().await
+                            .map_err(|e| format!("Failed to read Ollama installer bytes: {}", e))?;
+                        std::fs::write(&installer_path, &bytes)
+                            .map_err(|e| format!("Failed to save OllamaSetup.exe: {}", e))?;
+                        chosen_installer = installer_path.clone();
+                    }
+
+                    let install = Command::new(&chosen_installer)
+                        .args(["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"])
+                        .output()
+                        .map_err(|e| format!("Failed to run Ollama installer: {}", e))?;
+
+                    // NOTE: deliberately NOT removing the installer anymore
+                    // so a subsequent wizard run can reuse it (saves ~1.85 GB
+                    // of redownload). The installer is idempotent.
+
+                    if !install.status.success() {
+                        return Err("Failed to install Ollama. Install manually from https://ollama.com/download/windows".to_string());
+                    }
+
+                    // Post-install: poll :11434/api/version every 1s for up
+                    // to 30s. If the daemon never comes up, fail loudly so
+                    // the wizard surfaces the problem instead of pretending
+                    // success.
+                    let probe = reqwest::Client::builder()
+                        .timeout(std::time::Duration::from_secs(2))
+                        .build()
+                        .unwrap_or_default();
+                    let mut up = false;
+                    for _ in 0..30 {
+                        if probe
+                            .get("http://127.0.0.1:11434/api/version")
+                            .send()
+                            .await
+                            .map(|r| r.status().is_success())
+                            .unwrap_or(false)
+                        {
+                            up = true;
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                    if !up {
+                        return Err(
+                            "Ollama installer ran but daemon did not start within 30s; check Windows Defender quarantine or try manual install".to_string(),
+                        );
+                    }
                 }
             }
         }
@@ -2640,17 +2781,27 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
                     .stderr(std::process::Stdio::null())
             ).spawn()
                 .map_err(|e| format!("Failed to start Ollama: {}", e))?;
-            // Wait for it to be ready
+            // Wait for it to be ready — up to 60s. Fail loudly if it never
+            // comes up; the wizard's previous behaviour was to fall through
+            // silently and then look "online" with a dead engine.
             let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(2))
                 .build()
                 .unwrap_or_default();
-            for _ in 0..20 {
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                if client.get("http://localhost:11434/api/tags")
+            let mut serve_up = false;
+            for _ in 0..60 {
+                if client.get("http://127.0.0.1:11434/api/tags")
                     .send().await
                     .map(|r| r.status().is_success())
-                    .unwrap_or(false) { break; }
+                    .unwrap_or(false)
+                {
+                    serve_up = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+            if !serve_up {
+                return Err("Ollama service not reachable on :11434 after 60s".to_string());
             }
         }
 
@@ -2909,6 +3060,41 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
                 }
             }
         }
+    }
+
+    // Final verification: confirm the selected model is actually reachable
+    // through the inference engine before we declare success. Skip on MLX —
+    // mlx_lm.server downloads on first request and we don't want to block the
+    // wizard waiting for an HF download here.
+    if engine == "ollama" {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap_or_default();
+        let tags = client
+            .get("http://127.0.0.1:11434/api/tags")
+            .send()
+            .await
+            .map_err(|e| format!("Final verification failed: cannot reach Ollama on :11434 ({})", e))?;
+        let body = tags
+            .text()
+            .await
+            .map_err(|e| format!("Final verification failed: read body: {}", e))?;
+        if !body.contains(&model) {
+            // Fall back to `ollama list` in case /api/tags is partially populated.
+            let list_out = Command::new(&ollama_cmd()).args(["list"]).output();
+            let listed = list_out
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).contains(&model))
+                .unwrap_or(false);
+            if !listed {
+                return Err(format!(
+                    "Final verification failed: model={} not found in Ollama after pull",
+                    model
+                ));
+            }
+        }
+        log_startup!("Verified: model={} reachable via Ollama on :11434", model);
     }
 
     // Upload all logs to backend (success case)
