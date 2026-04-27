@@ -3079,15 +3079,56 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
             .unwrap_or(false);
 
         if !model_cached {
-            // Pull the model
-            let pull = Command::new(&ollama_cmd())
-                .args(["pull", &model])
-                .output()
-                .map_err(|e| format!("Model pull failed: {}", e))?;
-            if !pull.status.success() {
-                let stderr = String::from_utf8_lossy(&pull.stderr).to_string();
-                return Err(format!("ollama pull {} failed: {}", model, stderr));
+            emit_wizard_progress(&window, WizardProgress {
+                step_id: "model_download".into(),
+                status: "active".into(),
+                detail: Some(format!("Pulling {}", model)),
+                ..Default::default()
+            });
+            use std::io::{BufRead, BufReader};
+            use std::process::Stdio;
+            let mut cmd = Command::new(&ollama_cmd());
+            cmd.args(["pull", &model]).stdout(Stdio::piped()).stderr(Stdio::piped());
+            hide_window(&mut cmd);
+            let mut child = cmd.spawn().map_err(|e| format!("Model pull spawn failed: {}", e))?;
+            let stdout = child.stdout.take().ok_or_else(|| "no stdout pipe".to_string())?;
+            let started = std::time::Instant::now();
+            let mut last_emit = std::time::Instant::now();
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if last_emit.elapsed().as_millis() >= 250 {
+                    // Parse percent using substring scan (no regex dep needed)
+                    let pct = line.find('%').and_then(|idx| {
+                        let before = &line[..idx];
+                        let start = before.rfind(|c: char| !c.is_ascii_digit() && c != '.').map(|i| i + 1).unwrap_or(0);
+                        before[start..].parse::<f32>().ok()
+                    });
+                    emit_wizard_progress(&window, WizardProgress {
+                        step_id: "model_download".into(),
+                        status: "active".into(),
+                        pct,
+                        detail: Some(line.chars().take(120).collect()),
+                        ..Default::default()
+                    });
+                    last_emit = std::time::Instant::now();
+                }
             }
+            let status = child.wait().map_err(|e| format!("Model pull wait failed: {}", e))?;
+            if !status.success() {
+                let _ = started; // suppress unused warning
+                emit_wizard_progress(&window, WizardProgress {
+                    step_id: "model_download".into(),
+                    status: "error".into(),
+                    error: Some(format!("ollama pull {} exited non-zero", model)),
+                    ..Default::default()
+                });
+                return Err(format!("ollama pull {} failed", model));
+            }
+            emit_wizard_progress(&window, WizardProgress {
+                step_id: "model_download".into(),
+                status: "done".into(),
+                detail: Some(format!("{} downloaded", model)),
+                ..Default::default()
+            });
         }
     }
 
@@ -3334,6 +3375,12 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
     // mlx_lm.server downloads on first request and we don't want to block the
     // wizard waiting for an HF download here.
     if engine == "ollama" {
+        emit_wizard_progress(&window, WizardProgress {
+            step_id: "model_verify".into(),
+            status: "active".into(),
+            detail: Some("Verifying model registered with Ollama".into()),
+            ..Default::default()
+        });
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
             .build()
@@ -3342,11 +3389,29 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
             .get("http://127.0.0.1:11434/api/tags")
             .send()
             .await
-            .map_err(|e| format!("Final verification failed: cannot reach Ollama on :11434 ({})", e))?;
+            .map_err(|e| {
+                let msg = format!("Final verification failed: cannot reach Ollama on :11434 ({})", e);
+                emit_wizard_progress(&window, WizardProgress {
+                    step_id: "model_verify".into(),
+                    status: "error".into(),
+                    error: Some(msg.clone()),
+                    ..Default::default()
+                });
+                msg
+            })?;
         let body = tags
             .text()
             .await
-            .map_err(|e| format!("Final verification failed: read body: {}", e))?;
+            .map_err(|e| {
+                let msg = format!("Final verification failed: read body: {}", e);
+                emit_wizard_progress(&window, WizardProgress {
+                    step_id: "model_verify".into(),
+                    status: "error".into(),
+                    error: Some(msg.clone()),
+                    ..Default::default()
+                });
+                msg
+            })?;
         if !body.contains(&model) {
             // Fall back to `ollama list` in case /api/tags is partially populated.
             let list_out = Command::new(&ollama_cmd()).args(["list"]).output();
@@ -3355,12 +3420,25 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
                 .map(|o| String::from_utf8_lossy(&o.stdout).contains(&model))
                 .unwrap_or(false);
             if !listed {
-                return Err(format!(
+                let msg = format!(
                     "Final verification failed: model={} not found in Ollama after pull",
                     model
-                ));
+                );
+                emit_wizard_progress(&window, WizardProgress {
+                    step_id: "model_verify".into(),
+                    status: "error".into(),
+                    error: Some(msg.clone()),
+                    ..Default::default()
+                });
+                return Err(msg);
             }
         }
+        emit_wizard_progress(&window, WizardProgress {
+            step_id: "model_verify".into(),
+            status: "done".into(),
+            detail: Some("Model verified".into()),
+            ..Default::default()
+        });
         log_startup!("Verified: model={} reachable via Ollama on :11434", model);
     }
 
