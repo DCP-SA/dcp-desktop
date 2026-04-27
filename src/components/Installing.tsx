@@ -1,9 +1,12 @@
 import { useState, useEffect } from "react";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   startDaemon,
   getEstimatedEarnings,
-  installEngine,
   fullStartProvider,
+  preInstallSpeedProbe,
+  getModelMetadata,
+  type WizardProgress,
 } from "../lib/api";
 import type { GpuInfo, DaemonConfig } from "../lib/api";
 
@@ -22,12 +25,21 @@ interface InstallStep {
 
 const INITIAL_STEPS: InstallStep[] = [
   { label: "Detecting hardware...", status: "done" },
-  { label: "Downloading inference engine...", detail: "", status: "pending" },
-  { label: "Downloading AI model...", detail: "", status: "pending" },
-  { label: "Starting DCP daemon...", status: "pending" },
-  { label: "Connecting to DCP network...", status: "pending" },
-  { label: "Running first benchmark...", status: "pending" },
+  { label: "Speed test", detail: "", status: "pending" },
+  { label: "Downloading Ollama", detail: "", status: "pending" },
+  { label: "Installing Ollama", detail: "", status: "pending" },
+  { label: "Downloading model", detail: "", status: "pending" },
+  { label: "Loading model", detail: "", status: "pending" },
+  { label: "Starting DCP daemon", detail: "", status: "pending" },
+  { label: "Connecting to DCP network", detail: "", status: "pending" },
 ];
+
+function formatEta(seconds: number): string {
+  if (!isFinite(seconds) || seconds <= 0) return "—";
+  const m = Math.floor(seconds / 60);
+  const s = Math.floor(seconds % 60);
+  return m > 0 ? `${m}m${s.toString().padStart(2, "0")}s` : `${s}s`;
+}
 
 export function Installing({ apiKey, config, gpu, onComplete }: InstallingProps) {
   const [steps, setSteps] = useState<InstallStep[]>(INITIAL_STEPS);
@@ -38,6 +50,71 @@ export function Installing({ apiKey, config, gpu, onComplete }: InstallingProps)
   useEffect(() => {
     let cancelled = false;
 
+    // markStep is defined outside runInstall so the event listener can also use it
+    const markStep = (index: number, status: InstallStep["status"], detail?: string) => {
+      setSteps((prev) => {
+        const next = [...prev];
+        next[index] = { ...next[index], status, detail: detail ?? next[index].detail };
+        return next;
+      });
+    };
+
+    // ── Wizard progress event listener ──────────────────────────────
+    const stepIdToIndex: Record<string, number> = {
+      ollama_download: 2,
+      ollama_install: 3,
+      model_download: 4,
+      model_verify: 5,
+    };
+
+    let lastApply = 0;
+    let pending: WizardProgress | null = null;
+    let unlisten: UnlistenFn | undefined;
+
+    const apply = (p: WizardProgress) => {
+      const idx = stepIdToIndex[p.step_id];
+      if (idx == null) return;
+      let detail = p.detail ?? "";
+      if (p.pct != null) {
+        const mb =
+          p.mb_done != null && p.mb_total != null
+            ? ` ${p.mb_done.toFixed(0)}/${p.mb_total.toFixed(0)} MB`
+            : "";
+        const mbps = p.mbps != null ? ` @ ${p.mbps.toFixed(1)} Mbps` : "";
+        const eta = p.eta_seconds != null ? ` • ETA ${formatEta(p.eta_seconds)}` : "";
+        detail = `${p.pct.toFixed(0)}%${mb}${mbps}${eta}`;
+      }
+      if (p.status === "error") {
+        markStep(idx, "error", p.error ?? detail);
+      } else if (p.status === "done") {
+        markStep(idx, "done", detail || (p.detail ?? ""));
+      } else {
+        markStep(idx, "active", detail);
+      }
+    };
+
+    listen<WizardProgress>("wizard:progress", (event) => {
+      pending = event.payload;
+      const now = Date.now();
+      if (now - lastApply >= 250) {
+        lastApply = now;
+        if (pending) {
+          apply(pending);
+          pending = null;
+        }
+      } else {
+        setTimeout(() => {
+          if (pending) {
+            apply(pending);
+            pending = null;
+            lastApply = Date.now();
+          }
+        }, 250 - (now - lastApply));
+      }
+    }).then((fn) => {
+      unlisten = fn;
+    });
+
     async function runInstall() {
       // Defensive: if gpu detection failed, fall back to UA sniff so we don't
       // mislabel Windows/Linux as MLX. Only treat as Apple Silicon when the
@@ -45,107 +122,123 @@ export function Installing({ apiKey, config, gpu, onComplete }: InstallingProps)
       const uaIsMac =
         typeof navigator !== "undefined" && /Mac/i.test(navigator.platform || "");
       const isApple = (gpu?.is_apple_silicon ?? false) && uaIsMac;
-      const engineName = isApple ? "MLX" : "Ollama";
       const vramMb = gpu?.vram_mb ?? 0;
       const vramGb = Math.round(vramMb / 1024);
 
-      // Pick model based on memory
-      let modelDisplay: string;
-      if (isApple) {
-        if (vramGb >= 64) modelDisplay = "Qwen3 30B-A3B";
-        else if (vramGb >= 32) modelDisplay = "Qwen3 30B-A3B";
-        else if (vramGb >= 16) modelDisplay = "Qwen3 8B";
-        else modelDisplay = "Qwen3 4B";
-      } else {
-        if (vramGb >= 20) modelDisplay = "Qwen3 30B-A3B";
-        else if (vramGb >= 8) modelDisplay = "Qwen3 8B";
-        else modelDisplay = "Qwen3 4B";
-      }
+      // Step 1: Hardware (already done)
+      markStep(0, "done", `${gpu?.name ?? "Unknown"} • ${vramGb} GB`);
 
-      const markStep = (index: number, status: InstallStep["status"], detail?: string) => {
-        setSteps((prev) => {
-          const next = [...prev];
-          next[index] = { ...next[index], status, detail: detail ?? next[index].detail };
-          return next;
-        });
-      };
+      // Step 2: Speed probe
+      markStep(1, "active", "Measuring connection speed...");
+      let probedMbps: number | null = null;
+      try {
+        const probe = await preInstallSpeedProbe();
+        probedMbps = probe.mbps;
+      } catch {
+        // Non-fatal — proceed without speed data
+      }
+      markStep(
+        1,
+        "done",
+        probedMbps != null ? `${probedMbps.toFixed(1)} Mbps` : "skipped"
+      );
+
+      // Determine model ID matching backend logic
+      const modelId = isApple
+        ? vramGb >= 16
+          ? "mlx-community/Qwen3-8B-4bit"
+          : "mlx-community/Qwen3-4B-4bit"
+        : vramGb >= 20
+        ? "qwen3:30b-a3b"
+        : vramGb >= 8
+        ? "qwen3:8b"
+        : "qwen3:4b";
+
+      // Look up model metadata for size + ETA display
+      let metaDisplayName = modelId;
+      let metaSizeGb: number | null = null;
+      try {
+        const meta = await getModelMetadata(modelId);
+        metaDisplayName = meta.display_name;
+        metaSizeGb = meta.size_gb;
+      } catch {
+        // Non-fatal
+      }
+      const sizeStr =
+        metaSizeGb != null ? `${metaSizeGb.toFixed(1)} GB` : "size unknown";
+      const etaStr =
+        metaSizeGb != null && probedMbps != null
+          ? formatEta((metaSizeGb * 8000) / probedMbps)
+          : null;
+      markStep(
+        4,
+        "pending",
+        etaStr
+          ? `${metaDisplayName} • ${sizeStr} • ~${etaStr} @ ${probedMbps!.toFixed(0)} Mbps`
+          : `${metaDisplayName} • ${sizeStr}`
+      );
+
+      if (cancelled) return;
 
       try {
-        // Step 1: Hardware (already done)
-        markStep(0, "done", `${gpu?.name ?? "Unknown"} • ${vramGb} GB`);
+        // fullStartProvider handles: kill old procs → engine → model → server → daemon
+        // Events from Rust update steps 2-5 in real time via the listener above.
+        const result = await fullStartProvider(apiKey);
 
-        // Step 2: Install engine — fail loudly if the engine install errors.
-        // Previously this swallowed errors and marked the step "done" anyway,
-        // which is why wizards "succeeded" with no Ollama installed.
-        markStep(1, "active", `Installing ${engineName}...`);
-        try {
-          await installEngine();
-          markStep(1, "done", `${engineName} ready`);
-        } catch (e) {
-          const errMsg = String(e);
-          markStep(1, "error", errMsg);
-          setError(errMsg);
-          return;
-        }
-        if (cancelled) return;
+        // Parse result: "started:engine:model:pid:cached|downloaded"
+        const parts = result.split(":");
+        const wasCached = parts.length >= 5 && parts[4] === "cached";
 
-        // Step 3: Download model — this is the long one
-        markStep(2, "active", `Preparing ${modelDisplay}...`);
-        try {
-          // fullStartProvider handles: kill old procs → engine → model → server → daemon
-          const result = await fullStartProvider(apiKey);
-
-          // Parse result: "started:engine:model:pid:cached|downloaded"
-          const parts = result.split(":");
-          const wasCached = parts.length >= 5 && parts[4] === "cached";
-
-          if (wasCached) {
-            markStep(2, "done", `${modelDisplay} — already on disk, skipping download`);
-          } else {
-            markStep(2, "done", `${modelDisplay} downloaded`);
-          }
-
-          const pid = parts.length >= 4 ? parts[3] : "";
-          markStep(3, "done", `Inference server running`);
-          markStep(4, "done", `Daemon running (PID ${pid})`);
-          markStep(5, "done", "Connected to api.dcp.sa");
-        } catch (e) {
-          const errMsg = String(e);
-          // Check which step failed
-          if (errMsg.includes("MLX") || errMsg.includes("Ollama") || errMsg.includes("install")) {
-            markStep(1, "error", errMsg);
-          } else if (errMsg.includes("model") || errMsg.includes("pull") || errMsg.includes("download")) {
-            markStep(2, "error", errMsg);
-          } else if (errMsg.includes("daemon") || errMsg.includes("spawn")) {
-            markStep(3, "error", errMsg);
-          } else {
-            markStep(2, "error", errMsg);
-          }
-          setError(errMsg);
-          return;
+        if (wasCached) {
+          markStep(4, "done", `${metaDisplayName} — already on disk, skipping download`);
+          markStep(5, "done", "Model verified (cached)");
         }
 
-        if (cancelled) return;
-
-        // Save config
-        try {
-          await startDaemon(apiKey, config);
-        } catch {
-          // Config save — non-fatal
+        markStep(6, "done", parts.length >= 4 ? `Daemon running (PID ${parts[3]})` : "Daemon running");
+        markStep(7, "done", "Connected to api.dcp.sa");
+      } catch (e) {
+        const errMsg = String(e);
+        // Error events from Rust already mark the specific step; also set the
+        // component-level error string so the user sees it below the list.
+        if (
+          errMsg.includes("MLX") ||
+          errMsg.includes("Ollama") ||
+          errMsg.includes("install")
+        ) {
+          markStep(2, "error", errMsg);
+        } else if (
+          errMsg.includes("model") ||
+          errMsg.includes("pull") ||
+          errMsg.includes("download")
+        ) {
+          markStep(4, "error", errMsg);
+        } else if (errMsg.includes("daemon") || errMsg.includes("spawn")) {
+          markStep(6, "error", errMsg);
+        } else {
+          markStep(4, "error", errMsg);
         }
-
-        // Get earnings estimate
-        try {
-          const est = await getEstimatedEarnings(vramMb, isApple);
-          setEarnings(est);
-        } catch {
-          setEarnings(isApple ? 35 : 50);
-        }
-
-        setComplete(true);
-      } catch (err) {
-        if (!cancelled) setError(String(err));
+        setError(errMsg);
+        return;
       }
+
+      if (cancelled) return;
+
+      // Save config
+      try {
+        await startDaemon(apiKey, config);
+      } catch {
+        // Config save — non-fatal
+      }
+
+      // Get earnings estimate
+      try {
+        const est = await getEstimatedEarnings(vramMb, isApple);
+        setEarnings(est);
+      } catch {
+        setEarnings(isApple ? 35 : 50);
+      }
+
+      setComplete(true);
     }
 
     runInstall().catch((err) => {
@@ -154,6 +247,7 @@ export function Installing({ apiKey, config, gpu, onComplete }: InstallingProps)
 
     return () => {
       cancelled = true;
+      unlisten?.();
     };
   }, [apiKey, config, gpu]);
 
