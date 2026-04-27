@@ -2249,8 +2249,10 @@ async fn install_engine() -> Result<String, String> {
         std::fs::write(&installer_path, &bytes)
             .map_err(|e| format!("Failed to save OllamaSetup.exe: {}", e))?;
 
-        let output = Command::new(&installer_path)
-            .args(["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"])
+        let mut cmd_inst = Command::new(&installer_path);
+        cmd_inst.args(["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"]);
+        hide_window(&mut cmd_inst);
+        let output = cmd_inst
             .output()
             .map_err(|e| format!("Failed to run Ollama installer: {}", e))?;
 
@@ -2275,8 +2277,10 @@ async fn download_model(model_name: String) -> Result<String, String> {
     let has_ollama = command_exists("ollama");
 
     if has_ollama {
-        let output = Command::new(&ollama_cmd())
-            .args(["pull", &model_name])
+        let mut cmd_pull = Command::new(&ollama_cmd());
+        cmd_pull.args(["pull", &model_name]);
+        hide_window(&mut cmd_pull);
+        let output = cmd_pull
             .output()
             .map_err(|e| format!("Failed to pull model: {}", e))?;
 
@@ -2678,10 +2682,10 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
             let mut detected = 0u64;
             // Try nvidia-smi
             if let Some(path) = find_nvidia_smi() {
-                if let Ok(o) = Command::new(&path)
-                    .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
-                    .output()
-                {
+                let mut cmd_smi = Command::new(&path);
+                cmd_smi.args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"]);
+                hide_window(&mut cmd_smi);
+                if let Ok(o) = cmd_smi.output() {
                     let raw = String::from_utf8_lossy(&o.stdout).trim().to_string();
                     // Handle potential multi-line output (multi-GPU) — take first line
                     let first_line = raw.lines().next().unwrap_or(&raw);
@@ -3073,7 +3077,12 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
         }
 
         // Check if model already pulled
-        let list_output = Command::new(&ollama_cmd()).args(["list"]).output();
+        let list_output = {
+            let mut cmd_list = Command::new(&ollama_cmd());
+            cmd_list.args(["list"]);
+            hide_window(&mut cmd_list);
+            cmd_list.output()
+        };
         model_cached = list_output.ok()
             .map(|o| String::from_utf8_lossy(&o.stdout).contains(&model))
             .unwrap_or(false);
@@ -3135,11 +3144,12 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
     // Step 3.5 (Windows only): Ensure Python is available, install embedded Python if needed
     #[cfg(windows)]
     {
-        let python_ok = Command::new(python_cmd())
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+        let python_ok = {
+            let mut cmd_pyver = Command::new(python_cmd());
+            cmd_pyver.arg("--version");
+            hide_window(&mut cmd_pyver);
+            cmd_pyver.output().map(|o| o.status.success()).unwrap_or(false)
+        };
 
         if !python_ok {
             let python_dir = dcp_dir.join("python");
@@ -3163,15 +3173,17 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
                     .map_err(|e| format!("Python zip write failed: {}", e))?;
 
                 // Extract using PowerShell
-                let extract = Command::new("powershell")
-                    .args([
-                        "-NoProfile", "-Command",
-                        &format!(
-                            "Expand-Archive -Force -Path '{}' -DestinationPath '{}'",
-                            zip_path.display(),
-                            python_dir.display()
-                        ),
-                    ])
+                let mut cmd_ps = Command::new("powershell");
+                cmd_ps.args([
+                    "-NoProfile", "-Command",
+                    &format!(
+                        "Expand-Archive -Force -Path '{}' -DestinationPath '{}'",
+                        zip_path.display(),
+                        python_dir.display()
+                    ),
+                ]);
+                hide_window(&mut cmd_ps);
+                let extract = cmd_ps
                     .output()
                     .map_err(|e| format!("Python extract failed: {}", e))?;
                 if !extract.status.success() {
@@ -3212,8 +3224,10 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
                 std::fs::write(&getpip_path, &pip_bytes)
                     .map_err(|e| format!("get-pip write failed: {}", e))?;
 
-                let pip_install = Command::new(&python_exe)
-                    .arg(&getpip_path)
+                let mut cmd_pip = Command::new(&python_exe);
+                cmd_pip.arg(&getpip_path);
+                hide_window(&mut cmd_pip);
+                let pip_install = cmd_pip
                     .output()
                     .map_err(|e| format!("get-pip run failed: {}", e))?;
                 if !pip_install.status.success() {
@@ -3223,8 +3237,10 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
                 let _ = std::fs::remove_file(&getpip_path);
 
                 // Install required packages
-                let deps = Command::new(&python_exe)
-                    .args(["-m", "pip", "install", "requests", "psutil"])
+                let mut cmd_deps = Command::new(&python_exe);
+                cmd_deps.args(["-m", "pip", "install", "requests", "psutil"]);
+                hide_window(&mut cmd_deps);
+                let deps = cmd_deps
                     .output()
                     .map_err(|e| format!("pip install deps failed: {}", e))?;
                 if !deps.status.success() {
@@ -3414,7 +3430,12 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
             })?;
         if !body.contains(&model) {
             // Fall back to `ollama list` in case /api/tags is partially populated.
-            let list_out = Command::new(&ollama_cmd()).args(["list"]).output();
+            let list_out = {
+                let mut cmd_vlist = Command::new(&ollama_cmd());
+                cmd_vlist.args(["list"]);
+                hide_window(&mut cmd_vlist);
+                cmd_vlist.output()
+            };
             let listed = list_out
                 .ok()
                 .map(|o| String::from_utf8_lossy(&o.stdout).contains(&model))
