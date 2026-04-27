@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::process::Command;
 use std::sync::Mutex;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tauri::tray::{TrayIconBuilder, MouseButton, MouseButtonState};
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri_plugin_notification::NotificationExt;
@@ -967,6 +967,42 @@ fn hide_window(cmd: &mut Command) -> &mut Command {
 #[cfg(not(target_os = "windows"))]
 fn hide_window(cmd: &mut Command) -> &mut Command {
     cmd // no-op on Unix
+}
+
+#[derive(serde::Serialize, Clone, Default)]
+pub struct WizardProgress {
+    pub step_id: String,
+    pub status: String,
+    pub pct: Option<f32>,
+    pub mb_done: Option<f64>,
+    pub mb_total: Option<f64>,
+    pub mbps: Option<f64>,
+    pub eta_seconds: Option<u64>,
+    pub detail: Option<String>,
+    pub error: Option<String>,
+}
+
+fn emit_wizard_progress(window: &tauri::Window, payload: WizardProgress) {
+    let line = format!(
+        "[{}] [wizard step={} status={} pct={:?} mb={:?}/{:?} mbps={:?} eta={:?}] {}",
+        chrono_now(),
+        payload.step_id,
+        payload.status,
+        payload.pct,
+        payload.mb_done,
+        payload.mb_total,
+        payload.mbps,
+        payload.eta_seconds,
+        payload.detail.clone().unwrap_or_default(),
+    );
+    if let Ok(home) = dcp_home() {
+        let path = home.join("startup.log");
+        if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(&path) {
+            use std::io::Write;
+            let _ = writeln!(f, "{}", line);
+        }
+    }
+    let _ = window.emit("wizard:progress", payload);
 }
 
 /// M11 — atomic file write: write to a temp sibling, fsync, then rename.
