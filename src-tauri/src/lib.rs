@@ -2594,7 +2594,7 @@ async fn start_cloudflare_tunnel(dcp_dir: &std::path::Path, port: u16) -> Result
 // ── Full Provider Start (chains: engine install → model download → inference server → daemon) ──
 
 #[tauri::command]
-async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -> Result<String, String> {
+async fn full_start_provider(window: tauri::Window, api_key: String, state: State<'_, DaemonManager>) -> Result<String, String> {
     let dcp_dir = dcp_home()?;
 
     // Write startup log for debugging provider issues
@@ -2846,16 +2846,64 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
                         // Download OllamaSetup.exe directly — works on all
                         // Windows 10+ without winget.
                         log_startup!("Step 2: Downloading OllamaSetup.exe (~1.85 GB)");
+                        emit_wizard_progress(&window, WizardProgress {
+                            step_id: "ollama_download".into(),
+                            status: "active".into(),
+                            detail: Some("Starting Ollama download (~1.85 GB)".into()),
+                            ..Default::default()
+                        });
                         let response = reqwest::get("https://github.com/ollama/ollama/releases/latest/download/OllamaSetup.exe")
                             .await
                             .map_err(|e| format!("Failed to download Ollama installer: {}", e))?;
-                        let bytes = response.bytes().await
-                            .map_err(|e| format!("Failed to read Ollama installer bytes: {}", e))?;
-                        std::fs::write(&installer_path, &bytes)
-                            .map_err(|e| format!("Failed to save OllamaSetup.exe: {}", e))?;
+                        let total = response.content_length();
+                        let mut stream = response.bytes_stream();
+                        use futures_util::StreamExt;
+                        let mut file = std::fs::File::create(&installer_path)
+                            .map_err(|e| format!("Failed to create OllamaSetup.exe: {}", e))?;
+                        let mut downloaded: u64 = 0;
+                        let mut last_emit = std::time::Instant::now();
+                        let started = std::time::Instant::now();
+                        while let Some(chunk_res) = stream.next().await {
+                            let chunk = chunk_res.map_err(|e| format!("Download stream error: {}", e))?;
+                            use std::io::Write;
+                            file.write_all(&chunk).map_err(|e| format!("Write error: {}", e))?;
+                            downloaded += chunk.len() as u64;
+                            if last_emit.elapsed().as_millis() >= 250 {
+                                let elapsed_s = started.elapsed().as_secs_f64().max(0.001);
+                                let mbps = (downloaded as f64 * 8.0) / (elapsed_s * 1_000_000.0);
+                                let pct = total.map(|t| (downloaded as f32 / t as f32) * 100.0);
+                                let eta = total.and_then(|t| {
+                                    let remaining = t.saturating_sub(downloaded) as f64;
+                                    if mbps > 0.0 { Some((remaining * 8.0 / (mbps * 1_000_000.0)) as u64) } else { None }
+                                });
+                                emit_wizard_progress(&window, WizardProgress {
+                                    step_id: "ollama_download".into(),
+                                    status: "active".into(),
+                                    pct,
+                                    mb_done: Some(downloaded as f64 / 1_048_576.0),
+                                    mb_total: total.map(|t| t as f64 / 1_048_576.0),
+                                    mbps: Some(mbps),
+                                    eta_seconds: eta,
+                                    ..Default::default()
+                                });
+                                last_emit = std::time::Instant::now();
+                            }
+                        }
+                        emit_wizard_progress(&window, WizardProgress {
+                            step_id: "ollama_download".into(),
+                            status: "done".into(),
+                            detail: Some("Ollama installer downloaded".into()),
+                            ..Default::default()
+                        });
                         chosen_installer = installer_path.clone();
                     }
 
+                    emit_wizard_progress(&window, WizardProgress {
+                        step_id: "ollama_install".into(),
+                        status: "active".into(),
+                        detail: Some("Running Ollama installer (silent)".into()),
+                        ..Default::default()
+                    });
                     let install = Command::new(&chosen_installer)
                         .args(["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"])
                         .output()
@@ -2896,6 +2944,12 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
                             "Ollama installer ran but daemon did not start within 30s; check Windows Defender quarantine or try manual install".to_string(),
                         );
                     }
+                    emit_wizard_progress(&window, WizardProgress {
+                        step_id: "ollama_install".into(),
+                        status: "done".into(),
+                        detail: Some("Ollama running on :11434".into()),
+                        ..Default::default()
+                    });
                 }
             }
         }
