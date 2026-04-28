@@ -2323,11 +2323,85 @@ async fn update_daemon(api_key: String) -> Result<String, String> {
         }
     }
 
-    // 6. Replace the daemon file (M11 — atomic; G6 backup-before-overwrite is a separate task)
+    // 6. Audit G6 (Tier 4.18) — back up the current daemon BEFORE overwriting
+    //    so a bad update is recoverable. The .bak path is the dropoff point
+    //    rollback_daemon() reads from. We don't fail the update if backup
+    //    fails — first-install case has no current daemon to back up — but we
+    //    do log it via the returned status detail.
+    let backup_path = daemon_path.with_extension("py.bak");
+    let backup_status = if !current_bytes.is_empty() {
+        match atomic_write(&backup_path, &current_bytes) {
+            Ok(_) => "backed_up",
+            Err(_) => "backup_failed",
+        }
+    } else {
+        "no_prior"
+    };
+
+    // 7. Replace the daemon file (M11 — atomic).
     atomic_write(&daemon_path, &new_bytes)
         .map_err(|e| format!("Failed to write updated daemon: {}", e))?;
 
-    Ok(format!("updated:{}", manifest.version))
+    Ok(format!("updated:{}:{}", manifest.version, backup_status))
+}
+
+// Audit G6 (Tier 4.18) — companion to update_daemon. Restores ~/.dcp/dcp_daemon.py
+// from the .bak that update_daemon wrote before its last overwrite. The tray UI
+// (Tier 3.14 / G33 Report a Problem and Tier 3.15 / C2 updater error path) can
+// surface this as a "rollback" button when the new daemon misbehaves.
+//
+// Errors clearly when no .bak exists (e.g., first install, or rollback already
+// consumed). Does NOT chain another rollback — single-shot.
+#[tauri::command]
+async fn rollback_daemon() -> Result<String, String> {
+    let dcp_dir = dcp_home()?;
+    let daemon_path = dcp_dir.join("dcp_daemon.py");
+    let backup_path = daemon_path.with_extension("py.bak");
+
+    if !backup_path.exists() {
+        return Err(format!(
+            "No backup to roll back to at {}",
+            backup_path.display()
+        ));
+    }
+
+    let backup_bytes = std::fs::read(&backup_path)
+        .map_err(|e| format!("Failed to read backup: {}", e))?;
+
+    // Stop the running daemon first — same dance as update_daemon step 5.
+    if let Some(pid) = read_pid_file() {
+        if is_process_alive(pid) {
+            kill_process_graceful(pid);
+            for _ in 0..10 {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                if !is_process_alive(pid) { break; }
+            }
+            if is_process_alive(pid) {
+                kill_process_force(pid);
+            }
+            remove_pid_file();
+        }
+    }
+
+    atomic_write(&daemon_path, &backup_bytes)
+        .map_err(|e| format!("Failed to restore daemon from backup: {}", e))?;
+
+    // Best-effort version extract from the restored bytes for UI display.
+    let content = String::from_utf8_lossy(&backup_bytes);
+    let version = content
+        .lines()
+        .find(|l| l.contains("DAEMON_VERSION"))
+        .and_then(|l| {
+            l.split('=')
+                .last()
+                .map(|v| v.trim().trim_matches('"').trim_matches('\'').to_string())
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
+    // Consume the backup so a second rollback can't loop on the same .bak.
+    let _ = std::fs::remove_file(&backup_path);
+
+    Ok(format!("rolled_back:{}", version))
 }
 
 // ── Cloudflare Tunnel for NAT Traversal ─────────────────────────────
@@ -3322,6 +3396,7 @@ pub fn run() {
             install_engine,
             download_model,
             update_daemon,
+            rollback_daemon,
             full_start_provider,
         ])
         .build(tauri::generate_context!())
