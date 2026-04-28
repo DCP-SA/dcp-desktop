@@ -2220,17 +2220,52 @@ async fn download_model(model_name: String) -> Result<String, String> {
     Err("No inference engine found. Install Ollama or mlx-lm first.".to_string())
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct DaemonManifest {
+    version: String,
+    size: u64,
+    sha256: String,
+}
+
 #[tauri::command]
 async fn update_daemon(api_key: String) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+
     let dcp_dir = dcp_home()?;
     let daemon_path = dcp_dir.join("dcp_daemon.py");
+    let client = reqwest::Client::new();
 
-    // 1. Download latest daemon
+    // 1. Audit G19 — fetch the manifest first. The manifest is computed
+    //    server-side over the EXACT bytes that /download/daemon would serve
+    //    for this api_key (post-injection of API_KEY/API_URL/HMAC_SECRET).
+    //    Without this check a path-injection or in-flight tamper between the
+    //    backend and this client would be silently atomic_write'd into ~/.dcp.
+    let manifest_url = format!(
+        "https://api.dcp.sa/api/providers/download/daemon/manifest?key={}",
+        api_key
+    );
+    let manifest_resp = client
+        .get(&manifest_url)
+        .header("x-api-key", &api_key)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch daemon manifest: {}", e))?;
+    if !manifest_resp.status().is_success() {
+        return Err(format!(
+            "Failed to fetch daemon manifest: HTTP {}",
+            manifest_resp.status()
+        ));
+    }
+    let manifest: DaemonManifest = manifest_resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse daemon manifest: {}", e))?;
+
+    // 2. Download daemon bytes.
     let download_url = format!(
         "https://api.dcp.sa/api/providers/download/daemon?key={}",
         api_key
     );
-    let client = reqwest::Client::new();
     let resp = client
         .get(&download_url)
         .header("x-api-key", &api_key)
@@ -2247,13 +2282,33 @@ async fn update_daemon(api_key: String) -> Result<String, String> {
         .await
         .map_err(|e| format!("Failed to read daemon download: {}", e))?;
 
-    // 2. Compare with current file
+    // 3. Audit G19 — verify size + sha256 against the manifest BEFORE any
+    //    process kill or filesystem write. Reject on mismatch with a clear
+    //    error so the UI escape (Tier 3.15 / C2) can surface it.
+    if new_bytes.len() as u64 != manifest.size {
+        return Err(format!(
+            "Daemon size mismatch: manifest={} downloaded={} — refusing to install",
+            manifest.size,
+            new_bytes.len()
+        ));
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(&new_bytes);
+    let got = hex::encode(hasher.finalize());
+    if !got.eq_ignore_ascii_case(&manifest.sha256) {
+        return Err(format!(
+            "Daemon sha256 mismatch: manifest={} downloaded={} — refusing to install",
+            manifest.sha256, got
+        ));
+    }
+
+    // 4. Compare with current file (now safe — bytes are verified).
     let current_bytes = std::fs::read(&daemon_path).unwrap_or_default();
     if current_bytes == new_bytes.as_ref() {
         return Ok("already_latest".to_string());
     }
 
-    // 3. Stop the daemon if running
+    // 5. Stop the daemon if running.
     if let Some(pid) = read_pid_file() {
         if is_process_alive(pid) {
             kill_process_graceful(pid);
@@ -2268,23 +2323,11 @@ async fn update_daemon(api_key: String) -> Result<String, String> {
         }
     }
 
-    // 4. Replace the daemon file (M11 — atomic; G6 backup-before-overwrite is a separate task)
+    // 6. Replace the daemon file (M11 — atomic; G6 backup-before-overwrite is a separate task)
     atomic_write(&daemon_path, &new_bytes)
         .map_err(|e| format!("Failed to write updated daemon: {}", e))?;
 
-    // 5. Try to extract version from the new file
-    let content = String::from_utf8_lossy(&new_bytes);
-    let version = content
-        .lines()
-        .find(|l| l.contains("__version__") || l.contains("VERSION"))
-        .and_then(|l| {
-            l.split('=')
-                .last()
-                .map(|v| v.trim().trim_matches('"').trim_matches('\'').to_string())
-        })
-        .unwrap_or_else(|| "unknown".to_string());
-
-    Ok(format!("updated:{}", version))
+    Ok(format!("updated:{}", manifest.version))
 }
 
 // ── Cloudflare Tunnel for NAT Traversal ─────────────────────────────
