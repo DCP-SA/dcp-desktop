@@ -1,9 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::process::Command;
 use std::sync::Mutex;
-use tauri::{Manager, State};
+use tauri::{AppHandle, Manager, State};
 use tauri::tray::{TrayIconBuilder, MouseButton, MouseButtonState};
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
+use tauri_plugin_notification::NotificationExt;
 use reqwest;
 use serde_json::Value;
 
@@ -849,12 +850,15 @@ async fn fetch_recent_jobs(api_key: String) -> Result<Vec<JobEntry>, String> {
 
 #[tauri::command]
 async fn pause_provider(api_key: String) -> Result<(), String> {
+    // Tier 2.7 / G56: backend pause/resume read `key` from the body
+    // (providers.js:2010, :2029). We send both `key` and `api_key` so this
+    // command works against current backends without coupling the rename.
     let url = format!("{}/pause", API_BASE);
     let client = reqwest::Client::new();
     let resp = client
         .post(&url)
         .header("x-api-key", &api_key)
-        .json(&serde_json::json!({ "api_key": api_key }))
+        .json(&serde_json::json!({ "key": api_key, "api_key": api_key }))
         .send()
         .await
         .map_err(|e| format!("Network error: {}", e))?;
@@ -868,12 +872,13 @@ async fn pause_provider(api_key: String) -> Result<(), String> {
 
 #[tauri::command]
 async fn resume_provider(api_key: String) -> Result<(), String> {
+    // Tier 2.7 / G56: see pause_provider — backend reads `key` from the body.
     let url = format!("{}/resume", API_BASE);
     let client = reqwest::Client::new();
     let resp = client
         .post(&url)
         .header("x-api-key", &api_key)
-        .json(&serde_json::json!({ "api_key": api_key }))
+        .json(&serde_json::json!({ "key": api_key, "api_key": api_key }))
         .send()
         .await
         .map_err(|e| format!("Network error: {}", e))?;
@@ -906,6 +911,51 @@ async fn read_config() -> Result<SavedConfig, String> {
         start_on_boot: json["start_on_boot"].as_bool().unwrap_or(true),
         served_model: json["served_model"].as_str().unwrap_or("").to_string(),
     })
+}
+
+// ── Tier 2.7 / G56 — tray helpers ────────────────────────────────────
+//
+// The tray-menu Pause/Resume handlers run from a synchronous on_menu_event
+// closure that does not have access to a Tauri State. They need (1) the
+// provider's API key from disk and (2) a way to surface errors to the user.
+// These two helpers mirror the behaviour of the existing `read_config`
+// command and the dormant tauri_plugin_notification we already register
+// in setup().
+
+/// Read just the api_key field from ~/.dcp/config.json. Mirrors `read_config`
+/// but avoids requiring a Tauri State, which the menu callback can't supply.
+/// Returns `Err` for missing dir, missing file, unparsable JSON, or empty key.
+fn load_api_key_from_config() -> Result<String, String> {
+    let config_path = dirs::home_dir()
+        .ok_or_else(|| "Could not determine home directory".to_string())?
+        .join(".dcp")
+        .join("config.json");
+
+    let content = std::fs::read_to_string(&config_path)
+        .map_err(|e| format!("Failed to read {:?}: {}", config_path, e))?;
+
+    let json: Value = serde_json::from_str(&content)
+        .map_err(|e| format!("Failed to parse config: {}", e))?;
+
+    let key = json["api_key"].as_str().unwrap_or("").to_string();
+    if key.is_empty() {
+        return Err("api_key missing from config.json".to_string());
+    }
+    Ok(key)
+}
+
+/// Best-effort tray notification. Logs and swallows failures so a missing
+/// notification permission can never crash the menu handler.
+fn notify_tray(app: &AppHandle, title: &str, body: &str) {
+    if let Err(e) = app
+        .notification()
+        .builder()
+        .title(title)
+        .body(body)
+        .show()
+    {
+        eprintln!("[tray] notification failed ({}): {} — {}", e, title, body);
+    }
 }
 
 /// Hide console windows on Windows for spawned processes
@@ -3351,6 +3401,60 @@ pub fn run() {
                             if let Err(e) = open::that(&log_path) {
                                 eprintln!("Failed to open log file {:?}: {}", log_path, e);
                             }
+                        }
+                        "pause" => {
+                            // Tier 2.7 / G56: tray-driven pause. Spawn the
+                            // network call so the menu thread does not block
+                            // the UI; surface errors via eprintln + a tray
+                            // notification (best-effort — notification plugin
+                            // is already registered above).
+                            let app_handle = app.clone();
+                            tauri::async_runtime::spawn(async move {
+                                match load_api_key_from_config() {
+                                    Ok(key) => match pause_provider(key).await {
+                                        Ok(_) => {
+                                            eprintln!("[tray] pause_provider OK");
+                                            notify_tray(&app_handle, "DCP Provider paused",
+                                                "You will not receive new jobs until you resume.");
+                                        }
+                                        Err(e) => {
+                                            eprintln!("[tray] pause_provider failed: {}", e);
+                                            notify_tray(&app_handle, "DCP pause failed",
+                                                &format!("Could not pause: {}", e));
+                                        }
+                                    },
+                                    Err(e) => {
+                                        eprintln!("[tray] pause: load_api_key_from_config failed: {}", e);
+                                        notify_tray(&app_handle, "DCP pause failed",
+                                            &format!("Config unreadable: {}", e));
+                                    }
+                                }
+                            });
+                        }
+                        "resume" => {
+                            // Tier 2.7 / G56: tray-driven resume.
+                            let app_handle = app.clone();
+                            tauri::async_runtime::spawn(async move {
+                                match load_api_key_from_config() {
+                                    Ok(key) => match resume_provider(key).await {
+                                        Ok(_) => {
+                                            eprintln!("[tray] resume_provider OK");
+                                            notify_tray(&app_handle, "DCP Provider resumed",
+                                                "Now accepting jobs again.");
+                                        }
+                                        Err(e) => {
+                                            eprintln!("[tray] resume_provider failed: {}", e);
+                                            notify_tray(&app_handle, "DCP resume failed",
+                                                &format!("Could not resume: {}", e));
+                                        }
+                                    },
+                                    Err(e) => {
+                                        eprintln!("[tray] resume: load_api_key_from_config failed: {}", e);
+                                        notify_tray(&app_handle, "DCP resume failed",
+                                            &format!("Config unreadable: {}", e));
+                                    }
+                                }
+                            });
                         }
                         "quit" => {
                             app.exit(0);
