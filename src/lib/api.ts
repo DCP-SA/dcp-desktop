@@ -201,6 +201,10 @@ export async function updateDaemon(apiKey: string): Promise<string> {
   return invoke<string>("update_daemon", { apiKey });
 }
 
+export async function rollbackDaemon(): Promise<string> {
+  return invoke<string>("rollback_daemon");
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────
 
 export function formatVram(mb: number): string {
