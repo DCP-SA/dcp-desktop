@@ -954,6 +954,16 @@ fn load_api_key_from_config() -> Result<String, String> {
     Ok(key)
 }
 
+/// G57: Read a single string field from ~/.dcp/config.json by key name.
+/// Returns `None` on any error (missing file, bad JSON, missing field).
+/// Used by the tray refresh loop — must not panic or do network I/O.
+fn load_config_field(field: &str) -> Option<String> {
+    let config_path = dirs::home_dir()?.join(".dcp").join("config.json");
+    let content = std::fs::read_to_string(config_path).ok()?;
+    let json: Value = serde_json::from_str(&content).ok()?;
+    json[field].as_str().map(|s| s.to_string())
+}
+
 /// Best-effort tray notification. Logs and swallows failures so a missing
 /// notification permission can never crash the menu handler.
 fn notify_tray(app: &AppHandle, title: &str, body: &str) {
@@ -3585,6 +3595,13 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_store::Builder::new().build())
+        // G37: prevent multiple instances — second launch focuses existing window
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.show();
+                let _ = w.set_focus();
+            }
+        }))
         .setup(|app| {
             // ── System tray setup ────────────────────────────────────
             let show = MenuItemBuilder::with_id("show", "Open DCP Provider").build(app)?;
@@ -3734,6 +3751,57 @@ pub fn run() {
                     }
                 })
                 .build(app)?;
+
+            // ── G57: 60-second tray status refresh loop ─────────────────
+            // Reads local state only (PID file + config.json) — no network calls.
+            {
+                let status_item = status.clone();
+                let earnings_item = earnings.clone();
+                let _app_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let mut interval = tokio::time::interval(
+                        std::time::Duration::from_secs(60),
+                    );
+                    // The first tick fires immediately — skip it so we don't
+                    // race the initial "Status: Starting..." label.
+                    interval.tick().await;
+
+                    loop {
+                        interval.tick().await;
+
+                        // 1. Daemon alive? Check PID file + kill -0.
+                        let daemon_alive = read_pid_file()
+                            .map(is_process_alive)
+                            .unwrap_or(false);
+
+                        // 2. Read run_mode from config.json (idle / active / paused)
+                        let run_mode = load_config_field("run_mode")
+                            .unwrap_or_default();
+
+                        let status_text = if !daemon_alive {
+                            "Status: Offline".to_string()
+                        } else if run_mode == "paused" {
+                            "Status: Paused".to_string()
+                        } else {
+                            "Status: Online".to_string()
+                        };
+
+                        if let Err(e) = status_item.set_text(&status_text) {
+                            eprintln!("[tray-refresh] failed to update status: {}", e);
+                        }
+
+                        // 3. Earnings — read from config if the daemon writes it,
+                        //    otherwise keep the generic label.
+                        let earnings_text = match load_config_field("total_earnings") {
+                            Some(val) => format!("Earnings: ${}", val),
+                            None => "Earnings: —".to_string(),
+                        };
+                        if let Err(e) = earnings_item.set_text(&earnings_text) {
+                            eprintln!("[tray-refresh] failed to update earnings: {}", e);
+                        }
+                    }
+                });
+            }
 
             Ok(())
         })
