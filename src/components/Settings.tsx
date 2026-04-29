@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
+import { getVersion } from "@tauri-apps/api/app";
 import type { DaemonConfig } from "../lib/api";
 
 interface SettingsProps {
@@ -14,6 +15,11 @@ export function Settings({ onClose, apiKey, config, onSave }: SettingsProps) {
   const [tempLimit, setTempLimit] = useState(config.temp_limit);
   const [startOnBoot, setStartOnBoot] = useState(config.start_on_boot);
   const [copied, setCopied] = useState(false);
+  const [appVersion, setAppVersion] = useState("…");
+
+  useEffect(() => {
+    getVersion().then(setAppVersion).catch(() => setAppVersion("unknown"));
+  }, []);
 
   function handleSave() {
     onSave({
@@ -131,8 +137,7 @@ export function Settings({ onClose, apiKey, config, onSave }: SettingsProps) {
 
           {/* About */}
           <div className="settings-section settings-about">
-            <span className="settings-about-text">DCP Provider v0.1.0</span>
-            <span className="settings-about-text">Daemon v4.0.0-alpha.2</span>
+            <span className="settings-about-text">DCP Provider v{appVersion}</span>
           </div>
         </div>
 
