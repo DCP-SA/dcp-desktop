@@ -1,6 +1,7 @@
 import { useState, useEffect } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import type { DaemonConfig } from "../lib/api";
+import { rollbackDaemon } from "../lib/api";
 
 interface SettingsProps {
   onClose: () => void;
@@ -38,6 +39,31 @@ export function Settings({ onClose, apiKey, config, onSave }: SettingsProps) {
     }).catch(() => {
       // clipboard not available
     });
+  }
+
+  const [rollbackStatus, setRollbackStatus] = useState<string | null>(null);
+  const [rollbackLoading, setRollbackLoading] = useState(false);
+
+  async function handleRollback() {
+    if (!window.confirm(
+      "This will restore the previous daemon version and restart. This cannot be undone. Continue?"
+    )) {
+      return;
+    }
+    setRollbackLoading(true);
+    setRollbackStatus(null);
+    try {
+      const result = await rollbackDaemon();
+      const version = result.startsWith("rolled_back:")
+        ? result.replace("rolled_back:", "")
+        : result;
+      setRollbackStatus(`Restored version ${version}`);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setRollbackStatus(`Error: ${msg}`);
+    } finally {
+      setRollbackLoading(false);
+    }
   }
 
   function maskKey(key: string): string {
@@ -138,6 +164,31 @@ export function Settings({ onClose, apiKey, config, onSave }: SettingsProps) {
           {/* About */}
           <div className="settings-section settings-about">
             <span className="settings-about-text">DCP Provider v{appVersion}</span>
+          </div>
+
+          {/* Rollback Daemon */}
+          <div className="settings-section">
+            <label className="settings-label">Daemon Recovery</label>
+            <button
+              className="btn btn-secondary"
+              onClick={handleRollback}
+              disabled={rollbackLoading}
+              style={{ width: "100%" }}
+            >
+              {rollbackLoading ? "Rolling back…" : "Rollback to Previous Version"}
+            </button>
+            {rollbackStatus && (
+              <span
+                className="settings-about-text"
+                style={{
+                  display: "block",
+                  marginTop: "8px",
+                  color: rollbackStatus.startsWith("Error") ? "#ef4444" : "#22c55e",
+                }}
+              >
+                {rollbackStatus}
+              </span>
+            )}
           </div>
         </div>
 
