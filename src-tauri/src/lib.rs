@@ -634,7 +634,27 @@ async fn detect_system() -> Result<SystemInfo, String> {
 #[tauri::command]
 async fn validate_api_key(key: String) -> Result<bool, String> {
     // Validate format: must start with "dcp-provider-"
-    Ok(key.starts_with("dcp-provider-") && key.len() > 20)
+    if !(key.starts_with("dcp-provider-") && key.len() > 20) {
+        return Ok(false);
+    }
+
+    // Verify against backend — fall back to format-only if offline
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("https://api.dcp.sa/api/providers/me?key={}", key))
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await;
+
+    match resp {
+        Ok(r) if r.status().is_success() => Ok(true),
+        Ok(r) => Err(format!("API key rejected by server: HTTP {}", r.status())),
+        Err(e) => {
+            // Network error — allow offline mode but warn
+            eprintln!("[validate_api_key] Backend unreachable: {}. Proceeding with format-only check.", e);
+            Ok(true)
+        }
+    }
 }
 
 // H8 — register_provider removed. Registration happens through the web wizard
@@ -2721,15 +2741,12 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
         };
         // Benchmark-validated model selection by VRAM:
         // ≥24GB (4090/A5000/A6000): MoE 30B — best quality, 137-200 tok/s
-        // ≥12GB (3060Ti 12GB/4070): Dense 8B — 107-197 tok/s
-        //  ≥8GB (3060Ti 8GB/4060):  Mistral 7B — fastest at this tier (124-274 tok/s)
-        //  <8GB:                     Dense 4B — only option (163-270 tok/s)
+        // ≥10GB (3060Ti 12GB/4070): Dense 8B — 107-197 tok/s
+        //  <10GB (8GB/6GB cards):    Dense 4B — Mistral 7B OOMs on 8GB (163-270 tok/s)
         model = if vram_mb >= 20000 {
             "qwen3:30b-a3b".to_string()
         } else if vram_mb >= 10000 {
             "qwen3:8b".to_string()
-        } else if vram_mb >= 6000 {
-            "mistral:7b".to_string()
         } else {
             "qwen3:4b".to_string()
         };
@@ -3263,23 +3280,80 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
 
     log_startup!("Step 3: Model ready — cached={}, engine running on port {}", model_cached, if engine == "mlx" { 8000 } else { 11434 });
 
-    // Step 4: Always download latest daemon (auto-update on every start)
+    // Step 4: Download latest daemon with G19 sha256 verification (parity with update_daemon)
     let daemon_path = dcp_dir.join("dcp_daemon.py");
     {
-        let url = format!("https://api.dcp.sa/api/providers/download/daemon?key={}", api_key);
+        use sha2::{Digest, Sha256};
+
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .unwrap_or_default();
-        match client.get(&url).send().await {
+
+        // 4a. Fetch manifest for size + sha256 verification
+        let manifest_url = format!(
+            "https://api.dcp.sa/api/providers/download/daemon/manifest?key={}",
+            api_key
+        );
+        let manifest_result = client.get(&manifest_url).send().await;
+
+        let manifest: Option<DaemonManifest> = match manifest_result {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<DaemonManifest>().await {
+                    Ok(m) => Some(m),
+                    Err(e) => {
+                        log_startup!("Step 4a: Manifest parse failed: {} (skipping verification)", e);
+                        None
+                    }
+                }
+            }
+            Ok(resp) => {
+                log_startup!("Step 4a: Manifest fetch HTTP {} (skipping verification)", resp.status());
+                None
+            }
+            Err(e) => {
+                log_startup!("Step 4a: Manifest fetch failed: {} (skipping verification)", e);
+                None
+            }
+        };
+
+        // 4b. Download daemon bytes
+        let download_url = format!("https://api.dcp.sa/api/providers/download/daemon?key={}", api_key);
+        match client.get(&download_url).send().await {
             Ok(resp) if resp.status().is_success() => {
                 match resp.bytes().await {
                     Ok(bytes) => {
-                        // M11 — atomic write
-                        if let Err(e) = atomic_write(&daemon_path, &bytes) {
-                            log_startup!("Step 4a: Daemon write failed: {} (using cached)", e);
+                        // 4c. Verify against manifest if available
+                        if let Some(ref m) = manifest {
+                            if bytes.len() as u64 != m.size {
+                                log_startup!("Step 4a: Daemon size mismatch: manifest={} downloaded={} — refusing to install", m.size, bytes.len());
+                            } else {
+                                let mut hasher = Sha256::new();
+                                hasher.update(&bytes);
+                                let got = hex::encode(hasher.finalize());
+                                if !got.eq_ignore_ascii_case(&m.sha256) {
+                                    log_startup!("Step 4a: Daemon sha256 mismatch: manifest={} downloaded={} — refusing to install", m.sha256, got);
+                                } else {
+                                    // Verified — safe to write
+                                    if let Err(e) = atomic_write(&daemon_path, &bytes) {
+                                        log_startup!("Step 4a: Daemon write failed: {} (using cached)", e);
+                                    } else {
+                                        log_startup!("Step 4a: Daemon downloaded + verified ({} bytes, sha256 OK)", bytes.len());
+                                    }
+                                }
+                            }
                         } else {
-                            log_startup!("Step 4a: Daemon downloaded ({} bytes)", bytes.len());
+                            // No manifest available (offline/error) — write without verification
+                            // but only if no cached daemon exists (first install fallback)
+                            if !daemon_path.exists() {
+                                if let Err(e) = atomic_write(&daemon_path, &bytes) {
+                                    log_startup!("Step 4a: Daemon write failed: {} (no cached version)", e);
+                                } else {
+                                    log_startup!("Step 4a: Daemon downloaded WITHOUT verification ({} bytes, manifest unavailable)", bytes.len());
+                                }
+                            } else {
+                                log_startup!("Step 4a: Skipping unverified update — keeping cached daemon");
+                            }
                         }
                     }
                     Err(e) => {
@@ -3665,13 +3739,10 @@ pub fn run() {
                             let _ = open::that("https://dcp.sa/provider");
                         }
                         "logs" => {
-                            // G55/G32: daemon writes to ~/dcp-provider/logs/daemon.log
-                            // (LOG_DIR in dcp_daemon.py). Daemon 4.2.0 auto-migrates the
-                            // legacy ~/dc1-provider/ home, so this path is always current.
+                            // Daemon writes to ~/.dcp/daemon.log (dcp_home()).
                             let log_path = dirs::home_dir()
                                 .unwrap_or_default()
-                                .join("dcp-provider")
-                                .join("logs")
+                                .join(".dcp")
                                 .join("daemon.log");
                             if let Err(e) = open::that(&log_path) {
                                 eprintln!("Failed to open log file {:?}: {}", log_path, e);
@@ -3751,6 +3822,89 @@ pub fn run() {
                     }
                 })
                 .build(app)?;
+
+            // ── Auto-restart daemon on app launch if configured ──────────
+            // If the provider has been set up (api_key exists) and the daemon
+            // is not running (stale PID or missing PID file), restart it.
+            // This covers Windows reboot via autostart plugin and macOS
+            // LaunchAgent re-launch after a crash.
+            {
+                if let Ok(api_key) = load_api_key_from_config() {
+                    let daemon_alive = read_pid_file()
+                        .map(is_process_alive)
+                        .unwrap_or(false);
+                    if !daemon_alive {
+                        eprintln!("[startup] Daemon not running. Auto-restarting for configured provider.");
+                        remove_pid_file();
+                        let app_handle = app.handle().clone();
+                        tauri::async_runtime::spawn(async move {
+                            let dcp_dir = match dcp_home() {
+                                Ok(d) => d,
+                                Err(e) => { eprintln!("[startup] Auto-restart failed: {}", e); return; }
+                            };
+                            let daemon_path = dcp_dir.join("dcp_daemon.py");
+                            if !daemon_path.exists() {
+                                eprintln!("[startup] Auto-restart skipped: daemon not downloaded yet");
+                                return;
+                            }
+                            let log_path = dcp_dir.join("daemon.log");
+                            let err_log_path = dcp_dir.join("daemon_error.log");
+                            let log_file = match std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+                                Ok(f) => f,
+                                Err(e) => { eprintln!("[startup] Auto-restart log open failed: {}", e); return; }
+                            };
+                            let err_file = match std::fs::OpenOptions::new().create(true).append(true).open(&err_log_path) {
+                                Ok(f) => f,
+                                Err(e) => { eprintln!("[startup] Auto-restart err log open failed: {}", e); return; }
+                            };
+                            // Read served_model and engine from config
+                            let config_path = dcp_dir.join("config.json");
+                            let (served_model, engine_name) = if let Ok(content) = std::fs::read_to_string(&config_path) {
+                                if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
+                                    (
+                                        config.get("served_model").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                                        config.get("engine").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                                    )
+                                } else { (String::new(), String::new()) }
+                            } else { (String::new(), String::new()) };
+
+                            match detach_process(Command::new(python_cmd())
+                                .arg(&daemon_path)
+                                .arg("--no-watchdog")
+                                .arg("--key")
+                                .arg(&api_key)
+                                .arg("--url")
+                                .arg("https://api.dcp.sa")
+                                .env("DCP_SERVED_MODEL", &served_model)
+                                .env("DCP_ENGINE", &engine_name)
+                                .stdout(log_file)
+                                .stderr(err_file))
+                                .spawn()
+                            {
+                                Ok(child) => {
+                                    let pid = child.id();
+                                    if let Err(e) = write_pid_file(pid) {
+                                        eprintln!("[startup] Auto-restart PID write failed: {}", e);
+                                    }
+                                    // Update managed DaemonManager state
+                                    let state: tauri::State<'_, DaemonManager> = app_handle.state();
+                                    if let Ok(mut guard) = state.lock() {
+                                        guard.pid = Some(pid);
+                                        guard.status = "running".to_string();
+                                        guard.started_at = Some(std::time::Instant::now());
+                                        guard.last_restart = Some(std::time::Instant::now());
+                                        guard.restart_count += 1;
+                                    }
+                                    eprintln!("[startup] Auto-restart OK — daemon PID {}", pid);
+                                }
+                                Err(e) => {
+                                    eprintln!("[startup] Auto-restart spawn failed: {}", e);
+                                }
+                            }
+                        });
+                    }
+                }
+            }
 
             // ── G57: 60-second tray status refresh loop ─────────────────
             // Reads local state only (PID file + config.json) — no network calls.
