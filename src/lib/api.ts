@@ -241,3 +241,36 @@ export function getPerformanceTier(
 export async function fullStartProvider(apiKey: string): Promise<string> {
   return invoke<string>("full_start_provider", { apiKey });
 }
+
+// ── Wizard Progress Types + Commands ─────────────────────────────────
+
+export interface WizardProgress {
+  step_id: "ollama_download" | "ollama_install" | "model_download" | "model_verify" | string;
+  status: "active" | "done" | "error";
+  pct?: number | null;
+  mb_done?: number | null;
+  mb_total?: number | null;
+  mbps?: number | null;
+  eta_seconds?: number | null;
+  detail?: string | null;
+  error?: string | null;
+}
+
+export interface SpeedProbeResult {
+  mbps: number | null;
+  sample_bytes: number;
+  elapsed_ms: number;
+}
+
+export interface ModelMetadata {
+  display_name: string;
+  size_gb: number | null;
+}
+
+export async function preInstallSpeedProbe(): Promise<SpeedProbeResult> {
+  return invoke<SpeedProbeResult>("pre_install_speed_probe");
+}
+
+export async function getModelMetadata(modelId: string): Promise<ModelMetadata> {
+  return invoke<ModelMetadata>("get_model_metadata", { modelId });
+}

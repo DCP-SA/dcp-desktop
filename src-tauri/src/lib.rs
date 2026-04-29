@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::process::Command;
 use std::sync::Mutex;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tauri::tray::{TrayIconBuilder, MouseButton, MouseButtonState};
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri_plugin_notification::NotificationExt;
@@ -95,6 +95,16 @@ pub struct LiveMetrics {
 // ── API Response Structures ──────────────────────────────────────────
 
 const API_BASE: &str = "https://api.dcp.sa/api/providers";
+
+const MODEL_METADATA: &[(&str, &str, f64)] = &[
+    ("qwen3:30b-a3b", "Qwen3 30B-A3B", 17.7),
+    ("qwen3:8b", "Qwen3 8B", 5.2),
+    ("qwen3:4b", "Qwen3 4B", 2.5),
+    ("mistral:7b", "Mistral 7B", 4.1),
+    ("mlx-community/Qwen3-30B-A3B-4bit", "Qwen3 30B-A3B (MLX)", 16.4),
+    ("mlx-community/Qwen3-8B-4bit", "Qwen3 8B (MLX)", 4.5),
+    ("mlx-community/Qwen3-4B-4bit", "Qwen3 4B (MLX)", 2.3),
+];
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ProviderDashboard {
@@ -967,6 +977,42 @@ fn hide_window(cmd: &mut Command) -> &mut Command {
 #[cfg(not(target_os = "windows"))]
 fn hide_window(cmd: &mut Command) -> &mut Command {
     cmd // no-op on Unix
+}
+
+#[derive(serde::Serialize, Clone, Default)]
+pub struct WizardProgress {
+    pub step_id: String,
+    pub status: String,
+    pub pct: Option<f32>,
+    pub mb_done: Option<f64>,
+    pub mb_total: Option<f64>,
+    pub mbps: Option<f64>,
+    pub eta_seconds: Option<u64>,
+    pub detail: Option<String>,
+    pub error: Option<String>,
+}
+
+fn emit_wizard_progress(window: &tauri::Window, payload: WizardProgress) {
+    let line = format!(
+        "[{}] [wizard step={} status={} pct={:?} mb={:?}/{:?} mbps={:?} eta={:?}] {}",
+        chrono_now(),
+        payload.step_id,
+        payload.status,
+        payload.pct,
+        payload.mb_done,
+        payload.mb_total,
+        payload.mbps,
+        payload.eta_seconds,
+        payload.detail.clone().unwrap_or_default(),
+    );
+    if let Ok(home) = dcp_home() {
+        let path = home.join("startup.log");
+        if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(&path) {
+            use std::io::Write;
+            let _ = writeln!(f, "{}", line);
+        }
+    }
+    let _ = window.emit("wizard:progress", payload);
 }
 
 /// M11 — atomic file write: write to a temp sibling, fsync, then rename.
@@ -2203,8 +2249,10 @@ async fn install_engine() -> Result<String, String> {
         std::fs::write(&installer_path, &bytes)
             .map_err(|e| format!("Failed to save OllamaSetup.exe: {}", e))?;
 
-        let output = Command::new(&installer_path)
-            .args(["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"])
+        let mut cmd_inst = Command::new(&installer_path);
+        cmd_inst.args(["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"]);
+        hide_window(&mut cmd_inst);
+        let output = cmd_inst
             .output()
             .map_err(|e| format!("Failed to run Ollama installer: {}", e))?;
 
@@ -2229,8 +2277,10 @@ async fn download_model(model_name: String) -> Result<String, String> {
     let has_ollama = command_exists("ollama");
 
     if has_ollama {
-        let output = Command::new(&ollama_cmd())
-            .args(["pull", &model_name])
+        let mut cmd_pull = Command::new(&ollama_cmd());
+        cmd_pull.args(["pull", &model_name]);
+        hide_window(&mut cmd_pull);
+        let output = cmd_pull
             .output()
             .map_err(|e| format!("Failed to pull model: {}", e))?;
 
@@ -2548,7 +2598,7 @@ async fn start_cloudflare_tunnel(dcp_dir: &std::path::Path, port: u16) -> Result
 // ── Full Provider Start (chains: engine install → model download → inference server → daemon) ──
 
 #[tauri::command]
-async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -> Result<String, String> {
+async fn full_start_provider(window: tauri::Window, api_key: String, state: State<'_, DaemonManager>) -> Result<String, String> {
     let dcp_dir = dcp_home()?;
 
     // Write startup log for debugging provider issues
@@ -2632,10 +2682,10 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
             let mut detected = 0u64;
             // Try nvidia-smi
             if let Some(path) = find_nvidia_smi() {
-                if let Ok(o) = Command::new(&path)
-                    .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"])
-                    .output()
-                {
+                let mut cmd_smi = Command::new(&path);
+                cmd_smi.args(["--query-gpu=memory.total", "--format=csv,noheader,nounits"]);
+                hide_window(&mut cmd_smi);
+                if let Ok(o) = cmd_smi.output() {
                     let raw = String::from_utf8_lossy(&o.stdout).trim().to_string();
                     // Handle potential multi-line output (multi-GPU) — take first line
                     let first_line = raw.lines().next().unwrap_or(&raw);
@@ -2800,16 +2850,64 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
                         // Download OllamaSetup.exe directly — works on all
                         // Windows 10+ without winget.
                         log_startup!("Step 2: Downloading OllamaSetup.exe (~1.85 GB)");
+                        emit_wizard_progress(&window, WizardProgress {
+                            step_id: "ollama_download".into(),
+                            status: "active".into(),
+                            detail: Some("Starting Ollama download (~1.85 GB)".into()),
+                            ..Default::default()
+                        });
                         let response = reqwest::get("https://github.com/ollama/ollama/releases/latest/download/OllamaSetup.exe")
                             .await
                             .map_err(|e| format!("Failed to download Ollama installer: {}", e))?;
-                        let bytes = response.bytes().await
-                            .map_err(|e| format!("Failed to read Ollama installer bytes: {}", e))?;
-                        std::fs::write(&installer_path, &bytes)
-                            .map_err(|e| format!("Failed to save OllamaSetup.exe: {}", e))?;
+                        let total = response.content_length();
+                        let mut stream = response.bytes_stream();
+                        use futures_util::StreamExt;
+                        let mut file = std::fs::File::create(&installer_path)
+                            .map_err(|e| format!("Failed to create OllamaSetup.exe: {}", e))?;
+                        let mut downloaded: u64 = 0;
+                        let mut last_emit = std::time::Instant::now();
+                        let started = std::time::Instant::now();
+                        while let Some(chunk_res) = stream.next().await {
+                            let chunk = chunk_res.map_err(|e| format!("Download stream error: {}", e))?;
+                            use std::io::Write;
+                            file.write_all(&chunk).map_err(|e| format!("Write error: {}", e))?;
+                            downloaded += chunk.len() as u64;
+                            if last_emit.elapsed().as_millis() >= 250 {
+                                let elapsed_s = started.elapsed().as_secs_f64().max(0.001);
+                                let mbps = (downloaded as f64 * 8.0) / (elapsed_s * 1_000_000.0);
+                                let pct = total.map(|t| (downloaded as f32 / t as f32) * 100.0);
+                                let eta = total.and_then(|t| {
+                                    let remaining = t.saturating_sub(downloaded) as f64;
+                                    if mbps > 0.0 { Some((remaining * 8.0 / (mbps * 1_000_000.0)) as u64) } else { None }
+                                });
+                                emit_wizard_progress(&window, WizardProgress {
+                                    step_id: "ollama_download".into(),
+                                    status: "active".into(),
+                                    pct,
+                                    mb_done: Some(downloaded as f64 / 1_048_576.0),
+                                    mb_total: total.map(|t| t as f64 / 1_048_576.0),
+                                    mbps: Some(mbps),
+                                    eta_seconds: eta,
+                                    ..Default::default()
+                                });
+                                last_emit = std::time::Instant::now();
+                            }
+                        }
+                        emit_wizard_progress(&window, WizardProgress {
+                            step_id: "ollama_download".into(),
+                            status: "done".into(),
+                            detail: Some("Ollama installer downloaded".into()),
+                            ..Default::default()
+                        });
                         chosen_installer = installer_path.clone();
                     }
 
+                    emit_wizard_progress(&window, WizardProgress {
+                        step_id: "ollama_install".into(),
+                        status: "active".into(),
+                        detail: Some("Running Ollama installer (silent)".into()),
+                        ..Default::default()
+                    });
                     let install = Command::new(&chosen_installer)
                         .args(["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART"])
                         .output()
@@ -2850,6 +2948,12 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
                             "Ollama installer ran but daemon did not start within 30s; check Windows Defender quarantine or try manual install".to_string(),
                         );
                     }
+                    emit_wizard_progress(&window, WizardProgress {
+                        step_id: "ollama_install".into(),
+                        status: "done".into(),
+                        detail: Some("Ollama running on :11434".into()),
+                        ..Default::default()
+                    });
                 }
             }
         }
@@ -2973,32 +3077,79 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
         }
 
         // Check if model already pulled
-        let list_output = Command::new(&ollama_cmd()).args(["list"]).output();
+        let list_output = {
+            let mut cmd_list = Command::new(&ollama_cmd());
+            cmd_list.args(["list"]);
+            hide_window(&mut cmd_list);
+            cmd_list.output()
+        };
         model_cached = list_output.ok()
             .map(|o| String::from_utf8_lossy(&o.stdout).contains(&model))
             .unwrap_or(false);
 
         if !model_cached {
-            // Pull the model
-            let pull = Command::new(&ollama_cmd())
-                .args(["pull", &model])
-                .output()
-                .map_err(|e| format!("Model pull failed: {}", e))?;
-            if !pull.status.success() {
-                let stderr = String::from_utf8_lossy(&pull.stderr).to_string();
-                return Err(format!("ollama pull {} failed: {}", model, stderr));
+            emit_wizard_progress(&window, WizardProgress {
+                step_id: "model_download".into(),
+                status: "active".into(),
+                detail: Some(format!("Pulling {}", model)),
+                ..Default::default()
+            });
+            use std::io::{BufRead, BufReader};
+            use std::process::Stdio;
+            let mut cmd = Command::new(&ollama_cmd());
+            cmd.args(["pull", &model]).stdout(Stdio::piped()).stderr(Stdio::piped());
+            hide_window(&mut cmd);
+            let mut child = cmd.spawn().map_err(|e| format!("Model pull spawn failed: {}", e))?;
+            let stdout = child.stdout.take().ok_or_else(|| "no stdout pipe".to_string())?;
+            let started = std::time::Instant::now();
+            let mut last_emit = std::time::Instant::now();
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if last_emit.elapsed().as_millis() >= 250 {
+                    // Parse percent using substring scan (no regex dep needed)
+                    let pct = line.find('%').and_then(|idx| {
+                        let before = &line[..idx];
+                        let start = before.rfind(|c: char| !c.is_ascii_digit() && c != '.').map(|i| i + 1).unwrap_or(0);
+                        before[start..].parse::<f32>().ok()
+                    });
+                    emit_wizard_progress(&window, WizardProgress {
+                        step_id: "model_download".into(),
+                        status: "active".into(),
+                        pct,
+                        detail: Some(line.chars().take(120).collect()),
+                        ..Default::default()
+                    });
+                    last_emit = std::time::Instant::now();
+                }
             }
+            let status = child.wait().map_err(|e| format!("Model pull wait failed: {}", e))?;
+            if !status.success() {
+                let _ = started; // suppress unused warning
+                emit_wizard_progress(&window, WizardProgress {
+                    step_id: "model_download".into(),
+                    status: "error".into(),
+                    error: Some(format!("ollama pull {} exited non-zero", model)),
+                    ..Default::default()
+                });
+                return Err(format!("ollama pull {} failed", model));
+            }
+            emit_wizard_progress(&window, WizardProgress {
+                step_id: "model_download".into(),
+                status: "done".into(),
+                detail: Some(format!("{} downloaded", model)),
+                ..Default::default()
+            });
         }
     }
 
     // Step 3.5 (Windows only): Ensure Python is available, install embedded Python if needed
     #[cfg(windows)]
     {
-        let python_ok = Command::new(python_cmd())
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+        let python_ok = {
+            let mut cmd_pyver = Command::new(python_cmd());
+            cmd_pyver.arg("--version");
+            hide_window(&mut cmd_pyver);
+            cmd_pyver.output().map(|o| o.status.success()).unwrap_or(false)
+        };
 
         if !python_ok {
             let python_dir = dcp_dir.join("python");
@@ -3022,15 +3173,17 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
                     .map_err(|e| format!("Python zip write failed: {}", e))?;
 
                 // Extract using PowerShell
-                let extract = Command::new("powershell")
-                    .args([
-                        "-NoProfile", "-Command",
-                        &format!(
-                            "Expand-Archive -Force -Path '{}' -DestinationPath '{}'",
-                            zip_path.display(),
-                            python_dir.display()
-                        ),
-                    ])
+                let mut cmd_ps = Command::new("powershell");
+                cmd_ps.args([
+                    "-NoProfile", "-Command",
+                    &format!(
+                        "Expand-Archive -Force -Path '{}' -DestinationPath '{}'",
+                        zip_path.display(),
+                        python_dir.display()
+                    ),
+                ]);
+                hide_window(&mut cmd_ps);
+                let extract = cmd_ps
                     .output()
                     .map_err(|e| format!("Python extract failed: {}", e))?;
                 if !extract.status.success() {
@@ -3071,8 +3224,10 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
                 std::fs::write(&getpip_path, &pip_bytes)
                     .map_err(|e| format!("get-pip write failed: {}", e))?;
 
-                let pip_install = Command::new(&python_exe)
-                    .arg(&getpip_path)
+                let mut cmd_pip = Command::new(&python_exe);
+                cmd_pip.arg(&getpip_path);
+                hide_window(&mut cmd_pip);
+                let pip_install = cmd_pip
                     .output()
                     .map_err(|e| format!("get-pip run failed: {}", e))?;
                 if !pip_install.status.success() {
@@ -3082,8 +3237,10 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
                 let _ = std::fs::remove_file(&getpip_path);
 
                 // Install required packages
-                let deps = Command::new(&python_exe)
-                    .args(["-m", "pip", "install", "requests", "psutil"])
+                let mut cmd_deps = Command::new(&python_exe);
+                cmd_deps.args(["-m", "pip", "install", "requests", "psutil"]);
+                hide_window(&mut cmd_deps);
+                let deps = cmd_deps
                     .output()
                     .map_err(|e| format!("pip install deps failed: {}", e))?;
                 if !deps.status.success() {
@@ -3234,6 +3391,12 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
     // mlx_lm.server downloads on first request and we don't want to block the
     // wizard waiting for an HF download here.
     if engine == "ollama" {
+        emit_wizard_progress(&window, WizardProgress {
+            step_id: "model_verify".into(),
+            status: "active".into(),
+            detail: Some("Verifying model registered with Ollama".into()),
+            ..Default::default()
+        });
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(5))
             .build()
@@ -3242,25 +3405,61 @@ async fn full_start_provider(api_key: String, state: State<'_, DaemonManager>) -
             .get("http://127.0.0.1:11434/api/tags")
             .send()
             .await
-            .map_err(|e| format!("Final verification failed: cannot reach Ollama on :11434 ({})", e))?;
+            .map_err(|e| {
+                let msg = format!("Final verification failed: cannot reach Ollama on :11434 ({})", e);
+                emit_wizard_progress(&window, WizardProgress {
+                    step_id: "model_verify".into(),
+                    status: "error".into(),
+                    error: Some(msg.clone()),
+                    ..Default::default()
+                });
+                msg
+            })?;
         let body = tags
             .text()
             .await
-            .map_err(|e| format!("Final verification failed: read body: {}", e))?;
+            .map_err(|e| {
+                let msg = format!("Final verification failed: read body: {}", e);
+                emit_wizard_progress(&window, WizardProgress {
+                    step_id: "model_verify".into(),
+                    status: "error".into(),
+                    error: Some(msg.clone()),
+                    ..Default::default()
+                });
+                msg
+            })?;
         if !body.contains(&model) {
             // Fall back to `ollama list` in case /api/tags is partially populated.
-            let list_out = Command::new(&ollama_cmd()).args(["list"]).output();
+            let list_out = {
+                let mut cmd_vlist = Command::new(&ollama_cmd());
+                cmd_vlist.args(["list"]);
+                hide_window(&mut cmd_vlist);
+                cmd_vlist.output()
+            };
             let listed = list_out
                 .ok()
                 .map(|o| String::from_utf8_lossy(&o.stdout).contains(&model))
                 .unwrap_or(false);
             if !listed {
-                return Err(format!(
+                let msg = format!(
                     "Final verification failed: model={} not found in Ollama after pull",
                     model
-                ));
+                );
+                emit_wizard_progress(&window, WizardProgress {
+                    step_id: "model_verify".into(),
+                    status: "error".into(),
+                    error: Some(msg.clone()),
+                    ..Default::default()
+                });
+                return Err(msg);
             }
         }
+        emit_wizard_progress(&window, WizardProgress {
+            step_id: "model_verify".into(),
+            status: "done".into(),
+            detail: Some("Model verified".into()),
+            ..Default::default()
+        });
         log_startup!("Verified: model={} reachable via Ollama on :11434", model);
     }
 
@@ -3304,6 +3503,65 @@ async fn upload_provider_logs(api_key: &str, dcp_dir: &std::path::Path) {
         }))
         .send()
         .await;
+}
+
+// ── Wizard Helper Commands ───────────────────────────────────────────
+
+#[derive(serde::Serialize)]
+struct ModelMetadata {
+    display_name: String,
+    size_gb: Option<f64>,
+}
+
+#[tauri::command]
+fn get_model_metadata(model_id: String) -> ModelMetadata {
+    for (id, name, size) in MODEL_METADATA {
+        if *id == model_id {
+            return ModelMetadata {
+                display_name: name.to_string(),
+                size_gb: Some(*size),
+            };
+        }
+    }
+    ModelMetadata { display_name: model_id, size_gb: None }
+}
+
+#[derive(serde::Serialize)]
+struct SpeedProbeResult {
+    mbps: Option<f64>,
+    sample_bytes: u64,
+    elapsed_ms: u64,
+}
+
+#[tauri::command]
+async fn pre_install_speed_probe() -> SpeedProbeResult {
+    let url = "https://github.com/ollama/ollama/releases/latest/download/OllamaSetup.exe";
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return SpeedProbeResult { mbps: None, sample_bytes: 0, elapsed_ms: 0 },
+    };
+
+    let started = std::time::Instant::now();
+    let resp = client.get(url).header("Range", "bytes=0-10485759").send().await;
+    let resp = match resp {
+        Ok(r) => r,
+        Err(_) => return SpeedProbeResult { mbps: None, sample_bytes: 0, elapsed_ms: started.elapsed().as_millis() as u64 },
+    };
+    let bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(_) => return SpeedProbeResult { mbps: None, sample_bytes: 0, elapsed_ms: started.elapsed().as_millis() as u64 },
+    };
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    let sample_bytes = bytes.len() as u64;
+    let mbps = if elapsed_ms > 0 {
+        Some((sample_bytes as f64 * 8.0) / (elapsed_ms as f64 * 1000.0)) // (bytes*8 bits) / (ms * 1000) = Mbps
+    } else {
+        None
+    };
+    SpeedProbeResult { mbps, sample_bytes, elapsed_ms }
 }
 
 // ── App Entry ────────────────────────────────────────────────────────
@@ -3502,6 +3760,8 @@ pub fn run() {
             update_daemon,
             rollback_daemon,
             full_start_provider,
+            get_model_metadata,
+            pre_install_speed_probe,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
