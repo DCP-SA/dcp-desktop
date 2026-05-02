@@ -278,7 +278,7 @@ export function Dashboard() {
   const [startupSteps, setStartupSteps] = useState<StartupStep[]>([]);
   const startupCancelledRef = useRef(false);
 
-  // Load config on mount to get API key
+  // Load config on mount to get API key + served model
   useEffect(() => {
     readConfig()
       .then((cfg: SavedConfig) => {
@@ -289,6 +289,13 @@ export function Dashboard() {
           temp_limit: cfg.temp_limit,
           start_on_boot: cfg.start_on_boot,
         });
+        // Populate model from saved config so the Status section shows it
+        if (cfg.served_model) {
+          setPerformance((prev) => ({
+            ...prev,
+            model: cfg.served_model,
+          }));
+        }
       })
       .catch(() => {
         // Config not found — stay with mock data
@@ -1142,6 +1149,18 @@ export function Dashboard() {
                     {Math.floor(daemonStatus.uptime_seconds / 3600)}h {Math.floor((daemonStatus.uptime_seconds % 3600) / 60)}m uptime
                   </span>
                 )}
+                <button className="btn btn-secondary" style={{marginTop: '8px', fontSize: '12px', padding: '4px 12px'}}
+                  onClick={async () => {
+                    try {
+                      const { homeDir, join } = await import('@tauri-apps/api/path');
+                      const home = await homeDir();
+                      const logPath = await join(home, '.dcp', 'startup.log');
+                      const { open } = await import('@tauri-apps/plugin-shell');
+                      await open(logPath);
+                    } catch { /* ignore — file may not exist */ }
+                  }}>
+                  View Install Log
+                </button>
               </div>
             )}
           </section>

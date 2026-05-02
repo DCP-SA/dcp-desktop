@@ -46,6 +46,8 @@ export function Installing({ apiKey, config, gpu, onComplete }: InstallingProps)
   const [complete, setComplete] = useState(false);
   const [earnings, setEarnings] = useState(0);
   const [error, setError] = useState("");
+  const [logLines, setLogLines] = useState<string[]>([]);
+  const [showLog, setShowLog] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -96,6 +98,12 @@ export function Installing({ apiKey, config, gpu, onComplete }: InstallingProps)
     };
 
     listen<WizardProgress>("wizard:progress", (event) => {
+      // Accumulate log lines for the live log panel
+      const p = event.payload;
+      const timestamp = new Date().toLocaleTimeString();
+      const line = `[${timestamp}] ${p.step_id}: ${p.detail || p.status}`;
+      setLogLines(prev => [...prev, line]);
+
       pending = event.payload;
       const now = Date.now();
       if (now - lastApply >= 250) {
@@ -298,6 +306,23 @@ export function Installing({ apiKey, config, gpu, onComplete }: InstallingProps)
             ))}
           </div>
 
+          <div className="install-log-toggle" onClick={() => setShowLog(!showLog)} style={{
+            cursor: 'pointer', fontSize: '12px', color: '#6b7280', marginTop: '12px',
+            userSelect: 'none'
+          }}>
+            {showLog ? "\u25BC Hide Log" : "\u25B6 Show Install Log"} ({logLines.length} entries)
+          </div>
+          {showLog && (
+            <div className="install-log-panel" style={{
+              maxHeight: '200px', overflow: 'auto', background: 'rgba(0,0,0,0.3)',
+              borderRadius: '8px', padding: '12px', margin: '12px 0',
+              fontFamily: 'monospace', fontSize: '11px', lineHeight: '1.6',
+              color: '#9ca3af', userSelect: 'text'
+            }}>
+              {logLines.map((line, i) => <div key={i}>{line}</div>)}
+            </div>
+          )}
+
           <div className="progress-bar-container">
             <div className="progress-bar-track">
               <div
@@ -343,6 +368,9 @@ export function Installing({ apiKey, config, gpu, onComplete }: InstallingProps)
         <div className="input-error mt-12">
           <p>Installation error: {error}</p>
           <p className="text-sm text-muted mt-4">Check ~/.dcp/startup.log for details</p>
+          <p style={{fontSize: '11px', color: '#6b7280', marginTop: '8px'}}>
+            Detailed log: ~/.dcp/startup.log
+          </p>
         </div>
       )}
     </div>

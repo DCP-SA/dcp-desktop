@@ -705,7 +705,11 @@ async fn check_setup_complete() -> Result<bool, String> {
 
 #[tauri::command]
 async fn get_estimated_earnings(vram_mb: u64, is_apple_silicon: bool) -> Result<f64, String> {
-    // Rough earnings estimate based on hardware capability
+    // NOTE: These are hardcoded tier-based estimates, NOT real calculations.
+    // For an M2 with 12GB (vram_mb ~12288), this returns $15/mo (Apple Silicon, <16GB tier).
+    // For an M2 with 16GB unified, this returns $35/mo. The $35 estimate shown to most
+    // Mac users with 16-32GB is aspirational — actual earnings depend on network demand,
+    // uptime, and job volume. TODO(v0.3.0): replace with demand-weighted formula from backend.
     let base_rate = if is_apple_silicon {
         // Apple Silicon unified memory, MLX inference
         match vram_mb {
@@ -724,7 +728,7 @@ async fn get_estimated_earnings(vram_mb: u64, is_apple_silicon: bool) -> Result<
         }
     };
 
-    // Return monthly estimate in USD
+    // Return monthly estimate in USD (hardcoded tiers — see NOTE above)
     Ok(base_rate)
 }
 
@@ -1952,7 +1956,7 @@ async fn check_daemon_health() -> Result<HealthReport, String> {
                     let parts: Vec<&str> = data_line.split_whitespace().collect();
                     if parts.len() >= 4 {
                         let available_gb: u64 = parts[3].parse().unwrap_or(0);
-                        if available_gb >= 20 {
+                        if available_gb >= 10 {
                             checks.push(HealthCheck {
                                 name: "Disk Space".to_string(),
                                 status: "ok".to_string(),
@@ -1960,7 +1964,7 @@ async fn check_daemon_health() -> Result<HealthReport, String> {
                                 can_auto_fix: false,
                                 fix_action: None,
                             });
-                        } else if available_gb >= 10 {
+                        } else if available_gb >= 5 {
                             checks.push(HealthCheck {
                                 name: "Disk Space".to_string(),
                                 status: "warning".to_string(),
@@ -1995,9 +1999,9 @@ async fn check_daemon_health() -> Result<HealthReport, String> {
                 if let Some(data_line) = output.lines().nth(1) {
                     let avail_str = data_line.trim().trim_end_matches('G');
                     let available_gb: u64 = avail_str.parse().unwrap_or(0);
-                    let (status, msg) = if available_gb >= 20 {
+                    let (status, msg) = if available_gb >= 10 {
                         ("ok", format!("{}GB available", available_gb))
-                    } else if available_gb >= 10 {
+                    } else if available_gb >= 5 {
                         ("warning", format!("{}GB available — may need more for models", available_gb))
                     } else {
                         ("error", format!("Only {}GB available — insufficient for models", available_gb))
@@ -2028,9 +2032,9 @@ async fn check_daemon_health() -> Result<HealthReport, String> {
                     if let Some(bytes_str) = line.strip_prefix("FreeSpace=") {
                         let free_bytes: u64 = bytes_str.trim().parse().unwrap_or(0);
                         let available_gb = free_bytes / 1_073_741_824;
-                        let (status, msg) = if available_gb >= 20 {
+                        let (status, msg) = if available_gb >= 10 {
                             ("ok", format!("{}GB available", available_gb))
-                        } else if available_gb >= 10 {
+                        } else if available_gb >= 5 {
                             ("warning", format!("{}GB available — may need more for models", available_gb))
                         } else {
                             ("error", format!("Only {}GB available — insufficient for models", available_gb))
@@ -2989,6 +2993,28 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
         };
     }
 
+    // System snapshot for remote debugging
+    log_startup!("=== SYSTEM SNAPSHOT ===");
+    log_startup!("OS: {} {}", std::env::consts::OS, std::env::consts::ARCH);
+    if let Ok(hostname) = Command::new("hostname").output() {
+        log_startup!("Hostname: {}", String::from_utf8_lossy(&hostname.stdout).trim());
+    }
+    log_startup!("App version: 0.2.8");
+    // Disk free
+    if let Ok(output) = Command::new("df").args(["-h", "/"]).output() {
+        let df_text = String::from_utf8_lossy(&output.stdout).to_string();
+        let lines: Vec<&str> = df_text.lines().collect();
+        if lines.len() > 1 { log_startup!("Disk: {}", lines[1]); }
+    }
+    log_startup!("=== END SNAPSHOT ===");
+
+    emit_wizard_progress(&window, WizardProgress {
+        step_id: "snapshot".into(),
+        status: "done".into(),
+        detail: Some(format!("{} {} — v0.2.8", std::env::consts::OS, std::env::consts::ARCH)),
+        ..Default::default()
+    });
+
     // Step 0: Kill any existing DCP processes to avoid duplicates (cross-platform)
     kill_by_name("mlx_lm.server");
     kill_by_name("dcp_daemon.py");
@@ -3512,15 +3538,77 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
             });
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         } else {
+            // Download MLX model explicitly with progress reporting before starting server
             emit_wizard_progress(&window, WizardProgress {
                 step_id: "model_download".into(),
                 status: "active".into(),
-                detail: Some(format!("MLX server will download {} on first load", model)),
+                detail: Some(format!("Downloading {} from HuggingFace...", mlx_display_name)),
                 ..Default::default()
             });
+            log_startup!("Step 3a: Downloading MLX model {} via huggingface_hub", model);
+
+            let download_script = format!(
+                "import sys; from huggingface_hub import snapshot_download; \
+                 snapshot_download('{}', local_files_only=False)",
+                model
+            );
+            let dl_result = Command::new(python_cmd())
+                .args(["-u", "-c", &download_script])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn();
+
+            match dl_result {
+                Ok(mut dl_child) => {
+                    // Stream stderr for progress
+                    if let Some(stderr) = dl_child.stderr.take() {
+                        use std::io::{BufRead, BufReader};
+                        let window_clone = window.clone();
+                        let mut last_emit = std::time::Instant::now();
+                        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                            log_startup!("[mlx-dl] {}", line);
+                            if last_emit.elapsed().as_millis() >= 500 {
+                                emit_wizard_progress(&window_clone, WizardProgress {
+                                    step_id: "model_download".into(),
+                                    status: "active".into(),
+                                    detail: Some(line.chars().take(120).collect()),
+                                    ..Default::default()
+                                });
+                                last_emit = std::time::Instant::now();
+                            }
+                        }
+                    }
+                    match dl_child.wait() {
+                        Ok(exit) if exit.success() => {
+                            log_startup!("Step 3a: MLX model download completed successfully");
+                            emit_wizard_progress(&window, WizardProgress {
+                                step_id: "model_download".into(),
+                                status: "done".into(),
+                                detail: Some(format!("{} downloaded", mlx_display_name)),
+                                ..Default::default()
+                            });
+                            emit_wizard_progress(&window, WizardProgress {
+                                step_id: "model_verify".into(),
+                                status: "done".into(),
+                                detail: Some("Model verified and ready".into()),
+                                ..Default::default()
+                            });
+                        }
+                        Ok(exit) => {
+                            log_startup!("Step 3a: MLX download exited with code {:?}, server will retry", exit.code());
+                        }
+                        Err(e) => {
+                            log_startup!("Step 3a: MLX download wait error: {}, server will retry", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    log_startup!("Step 3a: MLX model download spawn failed: {}, server will retry on load", e);
+                }
+            }
         }
 
-        // Start mlx_lm.server — it auto-downloads the model on first run
+        // Start mlx_lm.server — it auto-downloads the model on first run (fallback if explicit download failed)
         let log_path = dcp_dir.join("mlx-server.log");
         // M7 — append, don't truncate
         let log_file = std::fs::OpenOptions::new().create(true).append(true).open(&log_path)
