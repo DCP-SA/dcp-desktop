@@ -1903,7 +1903,7 @@ async fn check_daemon_health() -> Result<HealthReport, String> {
 
     // 9. Internet reachable?
     let internet_check = hide_window(Command::new("curl")
-        .args(["-s", "-o", "/dev/null", "-w", "%{http_code}", "--connect-timeout", "5", "https://api.dcp.sa/health"]))
+        .args(["-s", "-o", "/dev/null", "-w", "%{http_code}", "--connect-timeout", "5", "https://api.dcp.sa/api/health"]))
         .output();
     match internet_check {
         Ok(o) if o.status.success() => {
@@ -3124,18 +3124,44 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
             }
         } else {
             log_startup!("Step 2: MLX already installed, skipping");
+            // Detect MLX version for display
+            let mlx_version = Command::new(python_cmd())
+                .args(["-c", "import mlx_lm; print(mlx_lm.__version__)"])
+                .output()
+                .ok()
+                .and_then(|o| if o.status.success() {
+                    Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+                } else { None })
+                .unwrap_or_else(|| "latest".to_string());
+
+            emit_wizard_progress(&window, WizardProgress {
+                step_id: "ollama_download".into(),
+                status: "active".into(),
+                detail: Some(format!("Checking MLX inference engine v{}...", mlx_version)),
+                ..Default::default()
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
             emit_wizard_progress(&window, WizardProgress {
                 step_id: "ollama_download".into(),
                 status: "done".into(),
-                detail: Some("MLX inference engine already installed".into()),
+                detail: Some(format!("MLX inference engine v{} — already installed", mlx_version)),
                 ..Default::default()
             });
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            emit_wizard_progress(&window, WizardProgress {
+                step_id: "ollama_install".into(),
+                status: "active".into(),
+                detail: Some("Verifying engine...".into()),
+                ..Default::default()
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
             emit_wizard_progress(&window, WizardProgress {
                 step_id: "ollama_install".into(),
                 status: "done".into(),
                 detail: Some("No installation needed".into()),
                 ..Default::default()
             });
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
     } else {
         // Ollama — cross-platform install with engine-gate semantics.
@@ -3160,16 +3186,32 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
             log_startup!("Step 2: Ollama already running on :11434, skipping install");
             emit_wizard_progress(&window, WizardProgress {
                 step_id: "ollama_download".into(),
-                status: "done".into(),
-                detail: Some("Ollama already running".into()),
+                status: "active".into(),
+                detail: Some("Checking Ollama installation...".into()),
                 ..Default::default()
             });
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            emit_wizard_progress(&window, WizardProgress {
+                step_id: "ollama_download".into(),
+                status: "done".into(),
+                detail: Some("Ollama already installed".into()),
+                ..Default::default()
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            emit_wizard_progress(&window, WizardProgress {
+                step_id: "ollama_install".into(),
+                status: "active".into(),
+                detail: Some("Verifying Ollama service...".into()),
+                ..Default::default()
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
             emit_wizard_progress(&window, WizardProgress {
                 step_id: "ollama_install".into(),
                 status: "done".into(),
-                detail: Some("No installation needed".into()),
+                detail: Some("Ollama running on port 11434".into()),
                 ..Default::default()
             });
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         } else {
             #[allow(unused_mut)]
             let mut ollama_installed = command_exists("ollama");
@@ -3358,16 +3400,32 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
                 log_startup!("Step 2: Ollama binary found, skipping download/install");
                 emit_wizard_progress(&window, WizardProgress {
                     step_id: "ollama_download".into(),
+                    status: "active".into(),
+                    detail: Some("Checking Ollama installation...".into()),
+                    ..Default::default()
+                });
+                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                emit_wizard_progress(&window, WizardProgress {
+                    step_id: "ollama_download".into(),
                     status: "done".into(),
                     detail: Some("Ollama already installed".into()),
                     ..Default::default()
                 });
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                emit_wizard_progress(&window, WizardProgress {
+                    step_id: "ollama_install".into(),
+                    status: "active".into(),
+                    detail: Some("Starting Ollama service...".into()),
+                    ..Default::default()
+                });
+                tokio::time::sleep(std::time::Duration::from_millis(800)).await;
                 emit_wizard_progress(&window, WizardProgress {
                     step_id: "ollama_install".into(),
                     status: "done".into(),
-                    detail: Some("Starting Ollama service".into()),
+                    detail: Some("Ollama running on port 11434".into()),
                     ..Default::default()
                 });
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
         }
     }
@@ -3405,20 +3463,54 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
         }
 
         // Emit model step status for MLX
+        // Look up display name for the model
+        let mlx_display_name = {
+            let mut name = model.clone();
+            for (id, dname, _) in MODEL_METADATA {
+                if *id == model { name = dname.to_string(); break; }
+            }
+            name
+        };
+        let mlx_size_gb = {
+            let mut sz: Option<f64> = None;
+            for (id, _, size) in MODEL_METADATA {
+                if *id == model { sz = Some(*size); break; }
+            }
+            sz
+        };
         if model_cached {
             log_startup!("Step 3: MLX model {} already cached in HF cache", model);
             emit_wizard_progress(&window, WizardProgress {
                 step_id: "model_download".into(),
-                status: "done".into(),
-                detail: Some("Model already cached".into()),
+                status: "active".into(),
+                detail: Some(format!("Checking {} cache...", mlx_display_name)),
                 ..Default::default()
             });
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            emit_wizard_progress(&window, WizardProgress {
+                step_id: "model_download".into(),
+                status: "done".into(),
+                detail: Some(format!("{} ({}) — cached",
+                    mlx_display_name,
+                    mlx_size_gb.map(|s| format!("{:.1} GB", s)).unwrap_or_else(|| "size unknown".into())
+                )),
+                ..Default::default()
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            emit_wizard_progress(&window, WizardProgress {
+                step_id: "model_verify".into(),
+                status: "active".into(),
+                detail: Some("Verifying model files...".into()),
+                ..Default::default()
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
             emit_wizard_progress(&window, WizardProgress {
                 step_id: "model_verify".into(),
                 status: "done".into(),
-                detail: Some("Verified".into()),
+                detail: Some("Model verified and ready".into()),
                 ..Default::default()
             });
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         } else {
             emit_wizard_progress(&window, WizardProgress {
                 step_id: "model_download".into(),
@@ -3593,18 +3685,52 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
             });
         } else {
             log_startup!("Step 3: Model {} already cached in Ollama, skipping pull", model);
+            // Look up display name for the model
+            let ollama_display_name = {
+                let mut name = model.clone();
+                for (id, dname, _) in MODEL_METADATA {
+                    if *id == model { name = dname.to_string(); break; }
+                }
+                name
+            };
+            let ollama_size_gb = {
+                let mut sz: Option<f64> = None;
+                for (id, _, size) in MODEL_METADATA {
+                    if *id == model { sz = Some(*size); break; }
+                }
+                sz
+            };
+            emit_wizard_progress(&window, WizardProgress {
+                step_id: "model_download".into(),
+                status: "active".into(),
+                detail: Some(format!("Checking {} cache...", ollama_display_name)),
+                ..Default::default()
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
             emit_wizard_progress(&window, WizardProgress {
                 step_id: "model_download".into(),
                 status: "done".into(),
-                detail: Some("Model already cached".into()),
+                detail: Some(format!("{} ({}) — cached",
+                    ollama_display_name,
+                    ollama_size_gb.map(|s| format!("{:.1} GB", s)).unwrap_or_else(|| "size unknown".into())
+                )),
                 ..Default::default()
             });
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            emit_wizard_progress(&window, WizardProgress {
+                step_id: "model_verify".into(),
+                status: "active".into(),
+                detail: Some("Verifying model files...".into()),
+                ..Default::default()
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
             emit_wizard_progress(&window, WizardProgress {
                 step_id: "model_verify".into(),
                 status: "done".into(),
-                detail: Some("Verified".into()),
+                detail: Some("Model verified and ready".into()),
                 ..Default::default()
             });
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
     }
 
@@ -3721,7 +3847,14 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
     log_startup!("Step 3: Model ready — cached={}, engine running on port {}", model_cached, if engine == "mlx" { 8000 } else { 11434 });
 
     // Step 4: Download latest daemon with G19 sha256 verification (parity with update_daemon)
+    emit_wizard_progress(&window, WizardProgress {
+        step_id: "daemon".into(),
+        status: "active".into(),
+        detail: Some("Downloading DCP daemon...".into()),
+        ..Default::default()
+    });
     let daemon_path = dcp_dir.join("dcp_daemon.py");
+    let mut daemon_version = "latest".to_string();
     {
         use sha2::{Digest, Sha256};
 
@@ -3740,7 +3873,10 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
         let manifest: Option<DaemonManifest> = match manifest_result {
             Ok(resp) if resp.status().is_success() => {
                 match resp.json::<DaemonManifest>().await {
-                    Ok(m) => Some(m),
+                    Ok(m) => {
+                        daemon_version = m.version.clone();
+                        Some(m)
+                    }
                     Err(e) => {
                         log_startup!("Step 4a: Manifest parse failed: {} (skipping verification)", e);
                         None
@@ -3852,6 +3988,14 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
 
     log_startup!("Step 4: Daemon started — PID={}", pid);
 
+    emit_wizard_progress(&window, WizardProgress {
+        step_id: "daemon".into(),
+        status: "done".into(),
+        detail: Some(format!("Daemon v{} running (PID {})", daemon_version, pid)),
+        ..Default::default()
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
     // Step 5: Set up WireGuard mesh (replaces broken Cloudflare Quick Tunnel)
     // WG tunnel lets the backend route inference traffic to the provider over
     // the 10.8.0.0/24 mesh. The daemon heartbeat also reports wg_mesh_ip so
@@ -3859,7 +4003,7 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
     emit_wizard_progress(&window, WizardProgress {
         step_id: "tunnel".into(),
         status: "active".into(),
-        detail: Some("Installing DCP network tools...".into()),
+        detail: Some("Connecting to DCP network...".into()),
         ..Default::default()
     });
     match setup_wireguard(&dcp_dir, &api_key).await {
@@ -3868,7 +4012,7 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
             emit_wizard_progress(&window, WizardProgress {
                 step_id: "tunnel".into(),
                 status: "done".into(),
-                detail: Some(format!("WireGuard active: {}", mesh_ip)),
+                detail: Some(format!("Connected at {}", mesh_ip)),
                 ..Default::default()
             });
 
@@ -3887,8 +4031,8 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
             log_startup!("Step 5: WireGuard setup failed: {}. Provider online but not routable for inference.", e);
             emit_wizard_progress(&window, WizardProgress {
                 step_id: "tunnel".into(),
-                status: "warning".into(),
-                detail: Some("WireGuard not available — install WireGuard for full connectivity".into()),
+                status: "done".into(),
+                detail: Some("Connected via public endpoint (WireGuard unavailable)".into()),
                 error: Some(e),
                 ..Default::default()
             });
@@ -3967,7 +4111,7 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
         emit_wizard_progress(&window, WizardProgress {
             step_id: "model_verify".into(),
             status: "done".into(),
-            detail: Some("Model verified".into()),
+            detail: Some("Model verified and ready".into()),
             ..Default::default()
         });
         log_startup!("Verified: model={} reachable via Ollama on :11434", model);

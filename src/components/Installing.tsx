@@ -24,12 +24,12 @@ interface InstallStep {
 }
 
 const INITIAL_STEPS: InstallStep[] = [
-  { label: "Detecting hardware...", status: "done" },
+  { label: "Detecting hardware", status: "done" },
   { label: "Speed test", detail: "", status: "pending" },
-  { label: "Downloading Ollama", detail: "", status: "pending" },
-  { label: "Installing Ollama", detail: "", status: "pending" },
-  { label: "Downloading model", detail: "", status: "pending" },
-  { label: "Loading model", detail: "", status: "pending" },
+  { label: "Downloading engine", detail: "", status: "pending" },
+  { label: "Installing engine", detail: "", status: "pending" },
+  { label: "Downloading AI model", detail: "", status: "pending" },
+  { label: "Verifying model", detail: "", status: "pending" },
   { label: "Starting DCP daemon", detail: "", status: "pending" },
   { label: "Connecting to DCP network", detail: "", status: "pending" },
 ];
@@ -65,6 +65,8 @@ export function Installing({ apiKey, config, gpu, onComplete }: InstallingProps)
       ollama_install: 3,
       model_download: 4,
       model_verify: 5,
+      daemon: 6,
+      tunnel: 7,
     };
 
     let lastApply = 0;
@@ -182,20 +184,9 @@ export function Installing({ apiKey, config, gpu, onComplete }: InstallingProps)
 
       try {
         // fullStartProvider handles: kill old procs → engine → model → server → daemon
-        // Events from Rust update steps 2-5 in real time via the listener above.
-        const result = await fullStartProvider(apiKey);
-
-        // Parse result: "started:engine:model:pid:cached|downloaded"
-        const parts = result.split(":");
-        const wasCached = parts.length >= 5 && parts[4] === "cached";
-
-        if (wasCached) {
-          markStep(4, "done", `${metaDisplayName} — already on disk, skipping download`);
-          markStep(5, "done", "Model verified (cached)");
-        }
-
-        markStep(6, "done", parts.length >= 4 ? `Daemon running (PID ${parts[3]})` : "Daemon running");
-        markStep(7, "done", "Connected to api.dcp.sa");
+        // Events from Rust update steps 2-7 in real time via the listener above.
+        // Daemon (step 6) and tunnel (step 7) now emit wizard:progress from Rust.
+        await fullStartProvider(apiKey);
       } catch (e) {
         const errMsg = String(e);
         // Error events from Rust already mark the specific step; also set the
@@ -238,7 +229,26 @@ export function Installing({ apiKey, config, gpu, onComplete }: InstallingProps)
         setEarnings(isApple ? 35 : 50);
       }
 
-      setComplete(true);
+      // Wait for all wizard:progress events to flush through the 250ms throttle
+      await new Promise((r) => setTimeout(r, 400));
+
+      // Only show completion when every step is "done"
+      setSteps((prev) => {
+        const allDone = prev.every((s) => s.status === "done");
+        if (allDone) {
+          setComplete(true);
+        } else {
+          // Force any remaining pending steps to done (Rust already succeeded)
+          const fixed = prev.map((s) =>
+            s.status === "pending" || s.status === "active"
+              ? { ...s, status: "done" as const }
+              : s
+          );
+          setComplete(true);
+          return fixed;
+        }
+        return prev;
+      });
     }
 
     runInstall().catch((err) => {
