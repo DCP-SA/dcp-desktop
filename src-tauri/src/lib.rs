@@ -3122,6 +3122,20 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
                     return Err("Failed to install MLX. Install manually: pip install mlx mlx-lm".to_string());
                 }
             }
+        } else {
+            log_startup!("Step 2: MLX already installed, skipping");
+            emit_wizard_progress(&window, WizardProgress {
+                step_id: "ollama_download".into(),
+                status: "done".into(),
+                detail: Some("MLX inference engine already installed".into()),
+                ..Default::default()
+            });
+            emit_wizard_progress(&window, WizardProgress {
+                step_id: "ollama_install".into(),
+                status: "done".into(),
+                detail: Some("No installation needed".into()),
+                ..Default::default()
+            });
         }
     } else {
         // Ollama — cross-platform install with engine-gate semantics.
@@ -3144,6 +3158,18 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
 
         if ollama_serving {
             log_startup!("Step 2: Ollama already running on :11434, skipping install");
+            emit_wizard_progress(&window, WizardProgress {
+                step_id: "ollama_download".into(),
+                status: "done".into(),
+                detail: Some("Ollama already running".into()),
+                ..Default::default()
+            });
+            emit_wizard_progress(&window, WizardProgress {
+                step_id: "ollama_install".into(),
+                status: "done".into(),
+                detail: Some("No installation needed".into()),
+                ..Default::default()
+            });
         } else {
             #[allow(unused_mut)]
             let mut ollama_installed = command_exists("ollama");
@@ -3328,6 +3354,20 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
                         ..Default::default()
                     });
                 }
+            } else {
+                log_startup!("Step 2: Ollama binary found, skipping download/install");
+                emit_wizard_progress(&window, WizardProgress {
+                    step_id: "ollama_download".into(),
+                    status: "done".into(),
+                    detail: Some("Ollama already installed".into()),
+                    ..Default::default()
+                });
+                emit_wizard_progress(&window, WizardProgress {
+                    step_id: "ollama_install".into(),
+                    status: "done".into(),
+                    detail: Some("Starting Ollama service".into()),
+                    ..Default::default()
+                });
             }
         }
     }
@@ -3364,6 +3404,30 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
             }
         }
 
+        // Emit model step status for MLX
+        if model_cached {
+            log_startup!("Step 3: MLX model {} already cached in HF cache", model);
+            emit_wizard_progress(&window, WizardProgress {
+                step_id: "model_download".into(),
+                status: "done".into(),
+                detail: Some("Model already cached".into()),
+                ..Default::default()
+            });
+            emit_wizard_progress(&window, WizardProgress {
+                step_id: "model_verify".into(),
+                status: "done".into(),
+                detail: Some("Verified".into()),
+                ..Default::default()
+            });
+        } else {
+            emit_wizard_progress(&window, WizardProgress {
+                step_id: "model_download".into(),
+                status: "active".into(),
+                detail: Some(format!("MLX server will download {} on first load", model)),
+                ..Default::default()
+            });
+        }
+
         // Start mlx_lm.server — it auto-downloads the model on first run
         let log_path = dcp_dir.join("mlx-server.log");
         // M7 — append, don't truncate
@@ -3378,6 +3442,22 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
             .stderr(err_file)
             .spawn()
             .map_err(|e| format!("Failed to start MLX server: {}", e))?;
+
+        // Emit final model step status for MLX (server spawned — model loads in background)
+        if !model_cached {
+            emit_wizard_progress(&window, WizardProgress {
+                step_id: "model_download".into(),
+                status: "done".into(),
+                detail: Some(format!("{} loading via MLX server", model)),
+                ..Default::default()
+            });
+            emit_wizard_progress(&window, WizardProgress {
+                step_id: "model_verify".into(),
+                status: "done".into(),
+                detail: Some("MLX server started".into()),
+                ..Default::default()
+            });
+        }
 
         // Write model info to config
         let config_path = dcp_dir.join("config.json");
@@ -3509,6 +3589,20 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
                 step_id: "model_download".into(),
                 status: "done".into(),
                 detail: Some(format!("{} downloaded", model)),
+                ..Default::default()
+            });
+        } else {
+            log_startup!("Step 3: Model {} already cached in Ollama, skipping pull", model);
+            emit_wizard_progress(&window, WizardProgress {
+                step_id: "model_download".into(),
+                status: "done".into(),
+                detail: Some("Model already cached".into()),
+                ..Default::default()
+            });
+            emit_wizard_progress(&window, WizardProgress {
+                step_id: "model_verify".into(),
+                status: "done".into(),
+                detail: Some("Verified".into()),
                 ..Default::default()
             });
         }
@@ -3994,46 +4088,69 @@ async fn get_network_status() -> Result<serde_json::Value, String> {
         } else { None }
     } else { None };
 
-    // Check if WG interface is active
-    #[cfg(not(windows))]
-    let wg_active = Command::new(wg_bin())
-        .args(["show", "wg0"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+    // Check if WG interface is active by looking for the mesh IP on any interface.
+    // We avoid `wg show` because it requires root on macOS.
+    // Instead: check if the mesh IP from config is assigned to any network interface,
+    // AND we can ping the VPS mesh gateway (10.8.0.1).
+    let (wg_active, latency_ms) = {
+        let mut active = false;
+        let mut lat: Option<u64> = None;
 
-    #[cfg(windows)]
-    let wg_active = Command::new("wireguard")
-        .args(["/dumplog", "wg0"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+        // Method 1: check ifconfig/ipconfig for the mesh IP
+        if let Some(ref ip) = mesh_ip {
+            #[cfg(not(windows))]
+            {
+                if let Ok(out) = Command::new("ifconfig").output() {
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    if stdout.contains(ip.as_str()) {
+                        active = true;
+                    }
+                }
+            }
+            #[cfg(windows)]
+            {
+                if let Ok(out) = Command::new("ipconfig").output() {
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    if stdout.contains(ip.as_str()) {
+                        active = true;
+                    }
+                }
+            }
+        }
 
-    // Get latest handshake time if active
-    let handshake_secs: Option<u64> = if wg_active {
-        Command::new(wg_bin())
-            .args(["show", "wg0", "latest-handshakes"])
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .and_then(|s| s.split_whitespace().last().and_then(|t| t.parse::<u64>().ok()))
-    } else { None };
+        // Method 2: if no mesh_ip in config, try pinging the VPS gateway
+        if !active {
+            let ping_args: Vec<&str> = if cfg!(windows) {
+                vec!["-n", "1", "-w", "1000", "10.8.0.1"]
+            } else {
+                vec!["-c", "1", "-W", "1", "10.8.0.1"]
+            };
+            if let Ok(o) = Command::new("ping").args(&ping_args).output() {
+                if o.status.success() {
+                    active = true;
+                }
+            }
+        }
 
-    // Measure latency to VPS (10.8.0.1)
-    let latency_ms: Option<u64> = if wg_active {
-        let start = std::time::Instant::now();
-        let ping_args: Vec<&str> = if cfg!(windows) {
-            vec!["-n", "1", "-w", "2000", "10.8.0.1"]
-        } else {
-            vec!["-c", "1", "-W", "2", "10.8.0.1"]
-        };
-        let ping = Command::new("ping").args(&ping_args).output();
-        if let Ok(o) = ping {
-            if o.status.success() {
-                Some(start.elapsed().as_millis() as u64)
-            } else { None }
-        } else { None }
-    } else { None };
+        // Measure latency if active
+        if active {
+            let start = std::time::Instant::now();
+            let ping_args: Vec<&str> = if cfg!(windows) {
+                vec!["-n", "1", "-w", "2000", "10.8.0.1"]
+            } else {
+                vec!["-c", "1", "-W", "2", "10.8.0.1"]
+            };
+            if let Ok(o) = Command::new("ping").args(&ping_args).output() {
+                if o.status.success() {
+                    lat = Some(start.elapsed().as_millis() as u64);
+                }
+            }
+        }
+
+        (active, lat)
+    };
+
+    let handshake_secs: Option<u64> = None; // Not available without root
 
     Ok(serde_json::json!({
         "connected": wg_active,

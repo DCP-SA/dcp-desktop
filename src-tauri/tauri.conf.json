@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/nickel-org/tauri/main/.schema/config.schema.json",
   "productName": "DCP Provider",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "identifier": "sa.dcp.provider",
   "build": {
     "beforeDevCommand": "npm run dev",

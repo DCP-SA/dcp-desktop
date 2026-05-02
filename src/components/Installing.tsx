@@ -274,6 +274,9 @@ export function Installing({ apiKey, config, gpu, onComplete }: InstallingProps)
                   )}
                   {step.status === "active" && <span className="spinner" />}
                   {step.status === "pending" && <span className="pending" />}
+                  {step.status === "error" && (
+                    <span className="error-icon" aria-label="error">&#10007;</span>
+                  )}
                 </div>
                 <span className="install-step-label">
                   {step.label}
@@ -328,7 +331,8 @@ export function Installing({ apiKey, config, gpu, onComplete }: InstallingProps)
 
       {error && (
         <div className="input-error mt-12">
-          Installation error: {error}
+          <p>Installation error: {error}</p>
+          <p className="text-sm text-muted mt-4">Check ~/.dcp/startup.log for details</p>
         </div>
       )}
     </div>
