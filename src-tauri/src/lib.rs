@@ -2870,48 +2870,131 @@ async fn activate_wireguard(dcp_dir: &std::path::Path) -> Result<(), String> {
     // Platform-specific activation
     #[cfg(target_os = "macos")]
     {
-        // macOS: wg-quick up/down require root. Use osascript to show a native
-        // macOS admin password dialog — no terminal needed. We combine down+up
-        // into a single admin prompt so the user only enters their password once.
+        // macOS: Install a launchd keeper daemon that manages the WG tunnel
+        // persistently — survives reboots, sleep/wake, wireguard-go crashes.
+        // Single admin prompt covers: wg-quick up + keeper script + launchd plist.
         let wq = wg_quick_bin();
         let conf = wg_conf_path.to_string_lossy().to_string();
 
         // First try without sudo (works if user already has passwordless sudo)
         let up_result = Command::new(wq).args(["up", &conf]).output();
-        match up_result {
-            Ok(output) if output.status.success() => return Ok(()),
-            Ok(_output) => {
-                // Needs root — use osascript admin prompt (native macOS dialog)
-                // Combine down + sleep + up in a single privileged shell script
-                eprintln!("[wg] wg-quick needs elevated permissions, using macOS admin prompt...");
-                let shell_cmd = format!(
-                    "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; {wq} down {conf} 2>/dev/null; sleep 0.5; {wq} up {conf}",
-                    wq = wq, conf = conf
-                ).replace('\"', "\\\"");
-                let osa_result = Command::new("osascript")
-                    .args(["-e", &format!(
-                        "do shell script \"{}\" with administrator privileges",
-                        shell_cmd
-                    )])
-                    .output();
-                match osa_result {
-                    Ok(o) if o.status.success() => return Ok(()),
-                    Ok(o) => {
-                        let stderr = String::from_utf8_lossy(&o.stderr);
-                        if stderr.contains("User canceled") || stderr.contains("canceled") {
-                            return Err("WireGuard setup cancelled — admin password required to activate the tunnel.".to_string());
-                        }
-                        return Err(format!("wg-quick up failed (admin): {}", stderr));
+        let needs_admin = match &up_result {
+            Ok(output) if output.status.success() => false,
+            _ => true,
+        };
+
+        // Build the keeper script content
+        let keeper_script = r#"#!/opt/homebrew/bin/bash
+export PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+LOG="/var/log/dcp-wireguard.log"
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$LOG"; }
+log "dcp-wg-keeper starting"
+wg-quick down wg0 2>/dev/null
+if wg-quick up wg0 2>>"$LOG"; then
+    log "Tunnel UP"
+else
+    log "ERROR: wg-quick up failed"
+    exit 1
+fi
+while true; do
+    sleep 60
+    if ! pgrep -q wireguard-go; then
+        log "wireguard-go died, restarting tunnel"
+        wg-quick down wg0 2>/dev/null
+        if wg-quick up wg0 2>>"$LOG"; then
+            log "Tunnel restored"
+        else
+            log "ERROR: tunnel restore failed, exiting for launchd restart"
+            exit 1
+        fi
+    fi
+done
+"#;
+
+        let plist_content = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>sa.dcp.wireguard</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/dcp-wg-keeper.sh</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>NetworkState</key>
+        <true/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>StandardOutPath</key>
+    <string>/var/log/dcp-wireguard.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/dcp-wireguard.log</string>
+</dict>
+</plist>
+"#;
+
+        // Write keeper script and plist to temp, then install with admin prompt
+        let keeper_tmp = std::env::temp_dir().join("dcp-wg-keeper.sh");
+        let plist_tmp = std::env::temp_dir().join("sa.dcp.wireguard.plist");
+        std::fs::write(&keeper_tmp, keeper_script)
+            .map_err(|e| format!("Failed to write keeper script: {}", e))?;
+        std::fs::write(&plist_tmp, plist_content)
+            .map_err(|e| format!("Failed to write plist: {}", e))?;
+
+        if needs_admin {
+            eprintln!("[wg] Installing persistent WG tunnel via launchd (one-time admin prompt)...");
+            let shell_cmd = format!(
+                concat!(
+                    "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; ",
+                    "cp {keeper} /usr/local/bin/dcp-wg-keeper.sh; ",
+                    "chmod 755 /usr/local/bin/dcp-wg-keeper.sh; ",
+                    "cp {plist} /Library/LaunchDaemons/sa.dcp.wireguard.plist; ",
+                    "chmod 644 /Library/LaunchDaemons/sa.dcp.wireguard.plist; ",
+                    "chown root:wheel /Library/LaunchDaemons/sa.dcp.wireguard.plist; ",
+                    "launchctl unload /Library/LaunchDaemons/sa.dcp.wireguard.plist 2>/dev/null; ",
+                    "{wq} down wg0 2>/dev/null; sleep 0.5; {wq} up {conf}; ",
+                    "launchctl load /Library/LaunchDaemons/sa.dcp.wireguard.plist"
+                ),
+                keeper = keeper_tmp.to_string_lossy(),
+                plist = plist_tmp.to_string_lossy(),
+                wq = wq, conf = conf
+            ).replace('\"', "\\\"");
+
+            let osa_result = Command::new("osascript")
+                .args(["-e", &format!(
+                    "do shell script \"{}\" with administrator privileges",
+                    shell_cmd
+                )])
+                .output();
+            match osa_result {
+                Ok(o) if o.status.success() => {
+                    eprintln!("[wg] Persistent WG tunnel installed via launchd");
+                    return Ok(());
+                }
+                Ok(o) => {
+                    let stderr = String::from_utf8_lossy(&o.stderr);
+                    if stderr.contains("User canceled") || stderr.contains("canceled") {
+                        return Err("WireGuard setup cancelled — admin password required to activate the tunnel.".to_string());
                     }
-                    Err(e) => return Err(format!("osascript admin prompt failed: {}", e)),
+                    return Err(format!("wg-quick up failed (admin): {}", stderr));
                 }
+                Err(e) => return Err(format!("osascript admin prompt failed: {}", e)),
             }
-            Err(e) => {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    return Err("wg-quick not found. Install: brew install wireguard-tools".to_string());
-                }
-                return Err(format!("wg-quick failed: {}", e));
-            }
+        } else {
+            // wg-quick succeeded without admin — still try to install keeper (best effort)
+            eprintln!("[wg] Tunnel up without admin. Installing keeper (best effort)...");
+            let _ = Command::new("osascript")
+                .args(["-e", &format!(
+                    "do shell script \"cp {} /usr/local/bin/dcp-wg-keeper.sh && chmod 755 /usr/local/bin/dcp-wg-keeper.sh && cp {} /Library/LaunchDaemons/sa.dcp.wireguard.plist && chmod 644 /Library/LaunchDaemons/sa.dcp.wireguard.plist && launchctl load /Library/LaunchDaemons/sa.dcp.wireguard.plist\" with administrator privileges",
+                    keeper_tmp.to_string_lossy(), plist_tmp.to_string_lossy()
+                )])
+                .output();
+            return Ok(());
         }
     }
 
