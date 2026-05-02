@@ -2534,95 +2534,301 @@ async fn rollback_daemon() -> Result<String, String> {
     Ok(format!("rolled_back:{}", version))
 }
 
-// ── Cloudflare Tunnel for NAT Traversal ─────────────────────────────
+// ── WireGuard Mesh Setup (replaces broken Cloudflare Quick Tunnel) ──
 
-/// Download cloudflared binary if not present, start tunnel, return the URL
-async fn start_cloudflare_tunnel(dcp_dir: &std::path::Path, port: u16) -> Result<String, String> {
-    // Kill any existing tunnel
-    kill_by_name("cloudflared");
-    std::thread::sleep(std::time::Duration::from_millis(500));
+/// Generate WG keypair, register with backend, write config, activate tunnel.
+/// Returns the assigned mesh IP on success.
+async fn setup_wireguard(dcp_dir: &std::path::Path, api_key: &str) -> Result<String, String> {
+    let wg_conf_path = dcp_dir.join("wg0.conf");
 
-    // Determine cloudflared binary path
-    let cloudflared_path = dcp_dir.join(if cfg!(windows) { "cloudflared.exe" } else { "cloudflared" });
-
-    // Download if not present
-    if !cloudflared_path.exists() {
-        let download_url = if cfg!(target_os = "windows") {
-            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
-        } else if cfg!(target_os = "macos") {
-            if cfg!(target_arch = "aarch64") {
-                "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-amd64.tgz"
-            } else {
-                "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-amd64.tgz"
+    // If we already have a running WG interface, check if it's healthy
+    #[cfg(unix)]
+    {
+        let check = Command::new("wg").args(["show", "wg0"]).output();
+        if let Ok(o) = check {
+            if o.status.success() {
+                let output = String::from_utf8_lossy(&o.stdout);
+                // WG is already up — extract our IP from the config file
+                if let Ok(conf) = std::fs::read_to_string(&wg_conf_path) {
+                    if let Some(ip_line) = conf.lines().find(|l| l.trim().starts_with("Address")) {
+                        if let Some(ip) = ip_line.split('=').nth(1) {
+                            let mesh_ip = ip.trim().split('/').next().unwrap_or("").to_string();
+                            if !mesh_ip.is_empty() {
+                                eprintln!("[wg] WireGuard wg0 already active, mesh IP: {}", mesh_ip);
+                                return Ok(mesh_ip);
+                            }
+                        }
+                    }
+                }
+                // WG is up but we can't determine our IP — treat as success with unknown IP
+                if output.contains("endpoint") {
+                    eprintln!("[wg] WireGuard wg0 active but could not determine mesh IP from config");
+                    return Ok("unknown".to_string());
+                }
             }
-        } else {
-            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
-        };
-
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
-            .build()
-            .unwrap_or_default();
-        let resp = client.get(download_url).send().await
-            .map_err(|e| format!("cloudflared download failed: {}", e))?;
-        if !resp.status().is_success() {
-            return Err(format!("cloudflared download HTTP {}", resp.status()));
-        }
-        let bytes = resp.bytes().await
-            .map_err(|e| format!("cloudflared read failed: {}", e))?;
-        std::fs::write(&cloudflared_path, &bytes)
-            .map_err(|e| format!("cloudflared write failed: {}", e))?;
-
-        // Make executable on Unix
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&cloudflared_path,
-                std::fs::Permissions::from_mode(0o755));
         }
     }
-
-    // Start the tunnel
-    let tunnel_log = dcp_dir.join("cloudflared.log");
-    // M7 — append, don't truncate
-    let log_file = std::fs::OpenOptions::new().create(true).append(true).open(&tunnel_log)
-        .map_err(|e| format!("Tunnel log open failed: {}", e))?;
-
-    let _tunnel = hide_window(
-        Command::new(&cloudflared_path)
-            .args(["tunnel", "--url", &format!("http://localhost:{}", port), "--no-autoupdate"])
-            .stdout(std::process::Stdio::null())
-            .stderr(log_file)
-    ).spawn()
-        .map_err(|e| format!("cloudflared start failed: {}", e))?;
-
-    // Wait for tunnel URL to appear in logs (up to 15 seconds)
-    let mut tunnel_url = String::new();
-    for _ in 0..30 {
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        if let Ok(log_content) = std::fs::read_to_string(&tunnel_log) {
-            // cloudflared prints the URL like: https://xxx-yyy.trycloudflare.com
-            for line in log_content.lines() {
-                if let Some(start) = line.find("https://") {
-                    let url_part = &line[start..];
-                    if url_part.contains(".trycloudflare.com") {
-                        // Extract just the URL
-                        let end = url_part.find(|c: char| c.is_whitespace() || c == '"' || c == '\'')
-                            .unwrap_or(url_part.len());
-                        tunnel_url = url_part[..end].to_string();
-                        break;
+    #[cfg(windows)]
+    {
+        let check = Command::new("wireguard").args(["/dumplog", "wg0"]).output();
+        if let Ok(o) = check {
+            if o.status.success() {
+                if let Ok(conf) = std::fs::read_to_string(&wg_conf_path) {
+                    if let Some(ip_line) = conf.lines().find(|l| l.trim().starts_with("Address")) {
+                        if let Some(ip) = ip_line.split('=').nth(1) {
+                            let mesh_ip = ip.trim().split('/').next().unwrap_or("").to_string();
+                            if !mesh_ip.is_empty() {
+                                eprintln!("[wg] WireGuard wg0 already active, mesh IP: {}", mesh_ip);
+                                return Ok(mesh_ip);
+                            }
+                        }
                     }
                 }
             }
-            if !tunnel_url.is_empty() { break; }
         }
     }
 
-    if tunnel_url.is_empty() {
-        return Err("cloudflared started but no tunnel URL found in logs".to_string());
+    // Step 1: Generate WG keypair
+    eprintln!("[wg] Generating WireGuard keypair...");
+    let (private_key, public_key) = generate_wg_keypair()?;
+
+    // Step 2: Register public key with backend
+    eprintln!("[wg] Registering public key with backend...");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .unwrap_or_default();
+
+    let resp = client
+        .post(format!("{}/wg/register", API_BASE))
+        .header("x-provider-key", api_key)
+        .json(&serde_json::json!({ "public_key": public_key }))
+        .send()
+        .await
+        .map_err(|e| format!("WG registration request failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("WG registration HTTP {}: {}", status, body));
     }
 
-    Ok(tunnel_url)
+    let wg_config: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("WG registration response parse failed: {}", e))?;
+
+    let mesh_ip = wg_config["ip"].as_str()
+        .ok_or("WG registration response missing 'ip'")?
+        .to_string();
+    let server_pubkey = wg_config["server_pubkey"].as_str()
+        .ok_or("WG registration response missing 'server_pubkey'")?
+        .to_string();
+    let server_endpoint = wg_config["server_endpoint"].as_str()
+        .ok_or("WG registration response missing 'server_endpoint'")?
+        .to_string();
+    // PSK is only returned on first registration, not on idempotent re-register
+    let psk = wg_config["psk"].as_str().map(|s| s.to_string());
+    let already_registered = wg_config["already_registered"].as_bool().unwrap_or(false);
+
+    eprintln!("[wg] Assigned mesh IP: {} (already_registered: {})", mesh_ip, already_registered);
+
+    // Step 3: Write WG config file (only if we have a PSK or it's a fresh registration)
+    if !already_registered || !wg_conf_path.exists() {
+        if let Some(ref psk_val) = psk {
+            let conf_content = format!(
+                "[Interface]\n\
+                 PrivateKey = {}\n\
+                 Address = {}/24\n\
+                 DNS = 1.1.1.1\n\
+                 \n\
+                 [Peer]\n\
+                 PublicKey = {}\n\
+                 PresharedKey = {}\n\
+                 Endpoint = {}\n\
+                 AllowedIPs = 10.8.0.0/24\n\
+                 PersistentKeepalive = 25\n",
+                private_key, mesh_ip, server_pubkey, psk_val, server_endpoint
+            );
+            std::fs::write(&wg_conf_path, &conf_content)
+                .map_err(|e| format!("Failed to write wg0.conf: {}", e))?;
+
+            // Restrict permissions on the config file (contains private key)
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&wg_conf_path,
+                    std::fs::Permissions::from_mode(0o600));
+            }
+
+            eprintln!("[wg] Wrote WG config to {}", wg_conf_path.display());
+        } else if already_registered && !wg_conf_path.exists() {
+            // Re-registered but no PSK returned and no local config — user must re-register
+            // with a new key. For now, log a warning.
+            eprintln!("[wg] WARNING: Already registered but no local config and no PSK returned. \
+                       WireGuard config file missing — delete wg_mesh_ip from backend and retry.");
+            return Err("WG config missing and re-registration returned no PSK. Contact support.".to_string());
+        }
+    }
+
+    // Step 4: Try to activate the WG tunnel
+    let activation_result = activate_wireguard(dcp_dir).await;
+    match &activation_result {
+        Ok(()) => {
+            eprintln!("[wg] WireGuard tunnel activated successfully");
+        }
+        Err(e) => {
+            eprintln!("[wg] WireGuard activation failed: {}. Config saved to {}", e, wg_conf_path.display());
+            eprintln!("[wg] Install WireGuard and run: wg-quick up {}", wg_conf_path.display());
+            // Don't fail the whole setup — config is saved for manual activation
+        }
+    }
+
+    Ok(mesh_ip)
+}
+
+/// Generate a WireGuard keypair. Tries `wg genkey`/`wg pubkey` first,
+/// falls back to pure-Rust x25519 if wg tools are not installed.
+fn generate_wg_keypair() -> Result<(String, String), String> {
+    // Try using wg tools (available if WireGuard is installed)
+    let genkey_result = Command::new("wg").arg("genkey").output();
+    if let Ok(output) = genkey_result {
+        if output.status.success() {
+            let private_key = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !private_key.is_empty() {
+                // Derive public key
+                let mut pubkey_cmd = Command::new("wg");
+                pubkey_cmd.arg("pubkey");
+                pubkey_cmd.stdin(std::process::Stdio::piped());
+                pubkey_cmd.stdout(std::process::Stdio::piped());
+                pubkey_cmd.stderr(std::process::Stdio::piped());
+                let mut child = pubkey_cmd.spawn()
+                    .map_err(|e| format!("wg pubkey spawn failed: {}", e))?;
+                if let Some(ref mut stdin) = child.stdin {
+                    use std::io::Write;
+                    let _ = stdin.write_all(private_key.as_bytes());
+                    let _ = stdin.write_all(b"\n");
+                }
+                let pubkey_output = child.wait_with_output()
+                    .map_err(|e| format!("wg pubkey failed: {}", e))?;
+                if pubkey_output.status.success() {
+                    let public_key = String::from_utf8_lossy(&pubkey_output.stdout).trim().to_string();
+                    if !public_key.is_empty() {
+                        return Ok((private_key, public_key));
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: without the `wg` CLI we cannot generate a valid Curve25519
+    // keypair (would need an x25519 crate). Tell the user to install WireGuard.
+    Err("WireGuard tools (wg) not found. Please install WireGuard:\n\
+         - macOS: brew install wireguard-tools\n\
+         - Linux: sudo apt install wireguard-tools\n\
+         - Windows: https://www.wireguard.com/install/".to_string())
+}
+
+/// Attempt to activate the WireGuard tunnel using wg-quick or platform tools.
+async fn activate_wireguard(dcp_dir: &std::path::Path) -> Result<(), String> {
+    let wg_conf_path = dcp_dir.join("wg0.conf");
+
+    if !wg_conf_path.exists() {
+        return Err("wg0.conf not found".to_string());
+    }
+
+    // First, bring down any existing wg0 interface (ignore errors — it may not be up)
+    #[cfg(unix)]
+    {
+        let _ = Command::new("wg-quick").args(["down", &wg_conf_path.to_string_lossy()]).output();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    // Platform-specific activation
+    #[cfg(target_os = "macos")]
+    {
+        // macOS: wg-quick up requires the conf file path
+        let up_result = Command::new("wg-quick")
+            .args(["up", &wg_conf_path.to_string_lossy()])
+            .output();
+        match up_result {
+            Ok(output) if output.status.success() => return Ok(()),
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                // If it failed because we need sudo, try with sudo
+                if stderr.contains("Permission denied") || stderr.contains("Operation not permitted") {
+                    eprintln!("[wg] wg-quick needs elevated permissions on macOS");
+                    return Err(format!("WireGuard needs sudo. Run: sudo wg-quick up {}", wg_conf_path.display()));
+                }
+                return Err(format!("wg-quick up failed: {}", stderr));
+            }
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    return Err("wg-quick not found. Install: brew install wireguard-tools".to_string());
+                }
+                return Err(format!("wg-quick failed: {}", e));
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let up_result = Command::new("wg-quick")
+            .args(["up", &wg_conf_path.to_string_lossy()])
+            .output();
+        match up_result {
+            Ok(output) if output.status.success() => return Ok(()),
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                return Err(format!("wg-quick up failed: {}", stderr));
+            }
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    return Err("wg-quick not found. Install: sudo apt install wireguard-tools".to_string());
+                }
+                return Err(format!("wg-quick failed: {}", e));
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        // Windows: try wireguard.exe /installtunnelservice
+        let conf_str = wg_conf_path.to_string_lossy().to_string();
+        let install_result = Command::new("wireguard")
+            .args(["/installtunnelservice", &conf_str])
+            .output();
+        match install_result {
+            Ok(output) if output.status.success() => return Ok(()),
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                // Try alternate path
+                let wg_exe = r"C:\Program Files\WireGuard\wireguard.exe";
+                if std::path::Path::new(wg_exe).exists() {
+                    let retry = Command::new(wg_exe)
+                        .args(["/installtunnelservice", &conf_str])
+                        .output();
+                    match retry {
+                        Ok(o) if o.status.success() => return Ok(()),
+                        _ => {}
+                    }
+                }
+                return Err(format!("wireguard /installtunnelservice failed: {}", stderr));
+            }
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    return Err("WireGuard not found. Install from https://www.wireguard.com/install/".to_string());
+                }
+                return Err(format!("wireguard.exe failed: {}", e));
+            }
+        }
+    }
+
+    // Fallback for other platforms
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    {
+        Err("WireGuard activation not supported on this platform. Manually run: wg-quick up wg0.conf".to_string())
+    }
 }
 
 // ── Full Provider Start (chains: engine install → model download → inference server → daemon) ──
@@ -3412,61 +3618,47 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
 
     log_startup!("Step 4: Daemon started — PID={}", pid);
 
-    // Step 5: Start Cloudflare Tunnel for NAT traversal
-    // This exposes the local inference server to the internet so the backend can route jobs
-    let inference_port = if engine == "mlx" { 8000 } else { 11434 };
-    let tunnel_url = match start_cloudflare_tunnel(&dcp_dir, inference_port).await {
-        Ok(url) => {
-            // Log success
-            let _ = std::fs::OpenOptions::new().append(true).create(true)
-                .open(dcp_dir.join("startup.log"))
-                .and_then(|mut f| { use std::io::Write; writeln!(f, "[tunnel] OK: {}", url) });
-            url
-        }
-        Err(e) => {
-            // Log failure — don't silently swallow
-            let _ = std::fs::OpenOptions::new().append(true).create(true)
-                .open(dcp_dir.join("startup.log"))
-                .and_then(|mut f| { use std::io::Write; writeln!(f, "[tunnel] FAILED: {}", e) });
-            // Continue without tunnel — provider will be online but unreachable for inference
-            String::new()
-        }
-    };
+    // Step 5: Set up WireGuard mesh (replaces broken Cloudflare Quick Tunnel)
+    // WG tunnel lets the backend route inference traffic to the provider over
+    // the 10.8.0.0/24 mesh. The daemon heartbeat also reports wg_mesh_ip so
+    // v1.js prefers mesh routing over public vllm_endpoint_url.
+    emit_wizard_progress(&window, WizardProgress {
+        step_id: "tunnel".into(),
+        status: "active".into(),
+        detail: Some("Setting up secure tunnel...".into()),
+        ..Default::default()
+    });
+    match setup_wireguard(&dcp_dir, &api_key).await {
+        Ok(mesh_ip) => {
+            log_startup!("Step 5: WireGuard active — mesh IP {}", mesh_ip);
+            emit_wizard_progress(&window, WizardProgress {
+                step_id: "tunnel".into(),
+                status: "done".into(),
+                detail: Some(format!("WireGuard active: {}", mesh_ip)),
+                ..Default::default()
+            });
 
-    // Step 6: Register tunnel URL with backend
-    if !tunnel_url.is_empty() {
-        let client = reqwest::Client::new();
-        // M3 — log if tunnel registration fails. If the backend doesn't have
-        // our tunnel URL, we never receive jobs; this used to fail silently.
-        match client.post(format!("{}/endpoint", API_BASE))
-            .json(&serde_json::json!({
-                "key": api_key,
-                "vllm_endpoint_url": tunnel_url
-            }))
-            .send()
-            .await
-        {
-            Ok(resp) if resp.status().is_success() => {
-                log_startup!("Step 6: Tunnel URL registered with backend");
-            }
-            Ok(resp) => {
-                log_startup!("Step 6: Tunnel registration HTTP {}", resp.status());
-            }
-            Err(e) => {
-                log_startup!("Step 6: Tunnel registration network error: {}", e);
-            }
-        }
-
-        // Save tunnel URL to config
-        let config_path = dcp_dir.join("config.json");
-        if let Ok(content) = std::fs::read_to_string(&config_path) {
-            if let Ok(mut config) = serde_json::from_str::<serde_json::Value>(&content) {
-                config["tunnel_url"] = serde_json::Value::String(tunnel_url.clone());
-                // M3 — log config-save failures
-                if let Err(e) = std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap_or_default()) {
-                    log_startup!("Step 6: Failed to save tunnel URL to config: {}", e);
+            // Save mesh IP to config.json so the daemon can read it
+            let config_path = dcp_dir.join("config.json");
+            if let Ok(content) = std::fs::read_to_string(&config_path) {
+                if let Ok(mut config) = serde_json::from_str::<serde_json::Value>(&content) {
+                    config["wg_mesh_ip"] = serde_json::Value::String(mesh_ip.clone());
+                    if let Err(e) = std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap_or_default()) {
+                        log_startup!("Step 5: Failed to save wg_mesh_ip to config: {}", e);
+                    }
                 }
             }
+        }
+        Err(e) => {
+            log_startup!("Step 5: WireGuard setup failed: {}. Provider online but not routable for inference.", e);
+            emit_wizard_progress(&window, WizardProgress {
+                step_id: "tunnel".into(),
+                status: "warning".into(),
+                detail: Some("WireGuard not available — install WireGuard for full connectivity".into()),
+                error: Some(e),
+                ..Default::default()
+            });
+            // Continue without WG — provider heartbeat works, just no mesh routing
         }
     }
 
@@ -3560,7 +3752,7 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
 /// Called after every startup attempt, whether success or failure
 async fn upload_provider_logs(api_key: &str, dcp_dir: &std::path::Path) {
     let mut logs = serde_json::Map::new();
-    for filename in &["startup.log", "gpu-detection.log", "daemon.log", "daemon_error.log", "cloudflared.log"] {
+    for filename in &["startup.log", "gpu-detection.log", "daemon.log", "daemon_error.log", "cloudflared.log", "wg0.conf"] {
         let path = dcp_dir.join(filename);
         if path.exists() {
             if let Ok(content) = std::fs::read_to_string(&path) {
