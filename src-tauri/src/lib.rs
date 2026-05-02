@@ -2881,7 +2881,7 @@ async fn activate_wireguard(dcp_dir: &std::path::Path) -> Result<(), String> {
                 // Combine down + sleep + up in a single privileged shell script
                 eprintln!("[wg] wg-quick needs elevated permissions, using macOS admin prompt...");
                 let shell_cmd = format!(
-                    "{wq} down {conf} 2>/dev/null; sleep 0.5; {wq} up {conf}",
+                    "export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH; {wq} down {conf} 2>/dev/null; sleep 0.5; {wq} up {conf}",
                     wq = wq, conf = conf
                 ).replace('\"', "\\\"");
                 let osa_result = Command::new("osascript")
