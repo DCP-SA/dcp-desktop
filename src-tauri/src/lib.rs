@@ -4392,6 +4392,22 @@ async fn pre_install_speed_probe() -> SpeedProbeResult {
 // ── Network Status & Key Rotation Commands ──────────────────────────
 
 #[tauri::command]
+async fn open_install_log() -> Result<(), String> {
+    let dcp_dir = dcp_home()?;
+    let log_path = dcp_dir.join("startup.log");
+    if !log_path.exists() {
+        return Err("Install log not found".to_string());
+    }
+    #[cfg(target_os = "macos")]
+    { let _ = Command::new("open").arg(&log_path).spawn(); }
+    #[cfg(target_os = "linux")]
+    { let _ = Command::new("xdg-open").arg(&log_path).spawn(); }
+    #[cfg(windows)]
+    { let _ = Command::new("notepad").arg(&log_path).spawn(); }
+    Ok(())
+}
+
+#[tauri::command]
 async fn get_network_status() -> Result<serde_json::Value, String> {
     let dcp_dir = dcp_home()?;
     let config_path = dcp_dir.join("config.json");
@@ -4921,6 +4937,7 @@ pub fn run() {
             get_network_status,
             rotate_network_key,
             reconnect_network,
+            open_install_log,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

@@ -1152,11 +1152,8 @@ export function Dashboard() {
                 <button className="btn btn-secondary" style={{marginTop: '8px', fontSize: '12px', padding: '4px 12px'}}
                   onClick={async () => {
                     try {
-                      const { homeDir, join } = await import('@tauri-apps/api/path');
-                      const home = await homeDir();
-                      const logPath = await join(home, '.dcp', 'startup.log');
-                      const { open } = await import('@tauri-apps/plugin-shell');
-                      await open('file://' + logPath);
+                      const { invoke } = await import('@tauri-apps/api/core');
+                      await invoke('open_install_log');
                     } catch { /* ignore — file may not exist */ }
                   }}>
                   View Install Log
