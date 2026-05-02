@@ -1,5 +1,6 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from "react";
-import { detectGpu, formatVram, fetchDashboard, fetchMetrics, fetchRecentJobs, pauseProvider, resumeProvider, readConfig, startDaemonProcess, stopDaemonProcess, getDaemonStatus, checkDaemonHealth, getLiveMetrics, fullStartProvider } from "../lib/api";
+import { detectGpu, formatVram, fetchDashboard, fetchMetrics, fetchRecentJobs, pauseProvider, resumeProvider, readConfig, startDaemonProcess, stopDaemonProcess, getDaemonStatus, checkDaemonHealth, getLiveMetrics, fullStartProvider, getNetworkStatus, rotateNetworkKey } from "../lib/api";
+import type { NetworkStatus } from "../lib/api";
 import type { GpuInfo, DaemonConfig, ProviderDashboard, ProviderMetrics, JobEntry as ApiJobEntry, SavedConfig, LiveMetrics, HealthReport, DaemonStatus as DaemonStatusType } from "../lib/api";
 import { Gauge } from "./Gauge";
 import { MiniBar } from "./MiniBar";
@@ -559,7 +560,25 @@ export function Dashboard() {
     }).catch(() => {});
   }, [account.providerId]);
 
-  // ── Existing logic ───────────────────────────────────────────────
+  // ── Network Status State & Polling ─────────────────────────────────
+  const [network, setNetwork] = useState<NetworkStatus | null>(null);
+  const [networkRotating, setNetworkRotating] = useState(false);
+
+  useEffect(() => {
+    const poll = async () => {
+      try {
+        const status = await getNetworkStatus();
+        setNetwork(status);
+      } catch (err) {
+        console.error("Network status poll failed:", err);
+      }
+    };
+    poll();
+    const interval = setInterval(poll, 30000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // ── Existing logic ────────────────────────────────────────��──────
   useEffect(() => {
     async function loadGpuInfo() {
       try {
@@ -1126,6 +1145,71 @@ export function Dashboard() {
             )}
           </section>
         )}
+
+        {/* ── DCP Network Section ──────────────────────────────────── */}
+        <section className="dashboard-section">
+          <h3 className="section-title">DCP Network</h3>
+          <div className="status-grid">
+            <div className="status-item">
+              <span className="status-item-label">Connection</span>
+              <span className="status-item-value">
+                <span className={`status-dot ${network?.connected ? 'status-earning' : 'status-idle'}`} style={{display: 'inline-block', marginRight: 6}} />
+                {network?.connected ? 'Connected' : 'Disconnected'}
+              </span>
+            </div>
+            {network?.mesh_ip && (
+              <div className="status-item">
+                <span className="status-item-label">Mesh IP</span>
+                <span className="status-item-value">{network.mesh_ip}</span>
+              </div>
+            )}
+            {network?.latency_ms != null && (
+              <div className="status-item">
+                <span className="status-item-label">Latency</span>
+                <span className="status-item-value">{network.latency_ms}ms</span>
+              </div>
+            )}
+            {network?.last_handshake_secs_ago != null && (
+              <div className="status-item">
+                <span className="status-item-label">Last Handshake</span>
+                <span className="status-item-value">{network.last_handshake_secs_ago}s ago</span>
+              </div>
+            )}
+          </div>
+          <div style={{display: 'flex', gap: 8, marginTop: 12}}>
+            {!network?.connected && (
+              <button className="btn btn-secondary" style={{flex: 1}}
+                onClick={async () => {
+                  try {
+                    const status = await getNetworkStatus();
+                    setNetwork(status);
+                  } catch {}
+                }}>
+                Reconnect
+              </button>
+            )}
+            <button
+              className="btn btn-secondary"
+              style={{flex: 1}}
+              disabled={networkRotating}
+              onClick={async () => {
+                setNetworkRotating(true);
+                try {
+                  const result = await rotateNetworkKey();
+                  console.log("Key rotation result:", result);
+                  // Refresh network status after rotation
+                  const status = await getNetworkStatus();
+                  setNetwork(status);
+                } catch (err) {
+                  console.error("Key rotation failed:", err);
+                } finally {
+                  setNetworkRotating(false);
+                }
+              }}>
+              {networkRotating ? 'Rotating...' : 'Rotate Key'}
+            </button>
+          </div>
+        </section>
 
         {/* ── Status Section ─────────────────────────────────────── */}
         <section className="dashboard-section">

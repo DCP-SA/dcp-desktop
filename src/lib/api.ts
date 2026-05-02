@@ -278,3 +278,20 @@ export async function preInstallSpeedProbe(): Promise<SpeedProbeResult> {
 export async function getModelMetadata(modelId: string): Promise<ModelMetadata> {
   return invoke<ModelMetadata>("get_model_metadata", { modelId });
 }
+
+// ── Network Status & Key Rotation ────────────────────────────────────
+
+export interface NetworkStatus {
+  connected: boolean;
+  mesh_ip: string | null;
+  latency_ms: number | null;
+  last_handshake_secs_ago: number | null;
+}
+
+export async function getNetworkStatus(): Promise<NetworkStatus> {
+  return invoke<NetworkStatus>("get_network_status");
+}
+
+export async function rotateNetworkKey(): Promise<string> {
+  return invoke<string>("rotate_network_key");
+}

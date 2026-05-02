@@ -2536,10 +2536,98 @@ async fn rollback_daemon() -> Result<String, String> {
 
 // ── WireGuard Mesh Setup (replaces broken Cloudflare Quick Tunnel) ──
 
+/// Auto-install WireGuard tools if not already present.
+/// macOS: brew install wireguard-tools
+/// Windows: download and run the silent NSIS installer
+/// Linux: apt-get install wireguard-tools
+async fn ensure_wireguard_installed() -> Result<(), String> {
+    // Check if wg command exists
+    let check = Command::new(if cfg!(windows) { "where" } else { "which" })
+        .arg("wg")
+        .output();
+
+    if let Ok(output) = check {
+        if output.status.success() {
+            return Ok(()); // Already installed
+        }
+    }
+
+    eprintln!("[wg] WireGuard tools not found, attempting auto-install...");
+
+    // Auto-install based on platform
+    #[cfg(target_os = "macos")]
+    {
+        let brew = Command::new("brew")
+            .args(["install", "wireguard-tools"])
+            .output()
+            .map_err(|e| format!("Failed to install WireGuard via brew: {}. Please install from https://www.wireguard.com/install/", e))?;
+        if !brew.status.success() {
+            let stderr = String::from_utf8_lossy(&brew.stderr);
+            return Err(format!("brew install wireguard-tools failed: {}. Please install WireGuard manually from https://www.wireguard.com/install/", stderr));
+        }
+        eprintln!("[wg] Installed wireguard-tools via brew");
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let dcp_dir = dcp_home()?;
+        let installer_path = dcp_dir.join("wireguard-installer.exe");
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .get("https://download.wireguard.com/windows-client/wireguard-installer.exe")
+            .send()
+            .await
+            .map_err(|e| format!("Failed to download WireGuard installer: {}", e))?;
+
+        let bytes = resp.bytes().await
+            .map_err(|e| format!("Failed to read WireGuard installer: {}", e))?;
+
+        std::fs::write(&installer_path, &bytes)
+            .map_err(|e| format!("Failed to save WireGuard installer: {}", e))?;
+
+        // Run silent install (NSIS /S flag)
+        let install = Command::new(&installer_path)
+            .args(["/S"])
+            .output()
+            .map_err(|e| format!("Failed to run WireGuard installer: {}", e))?;
+
+        if !install.status.success() {
+            let _ = std::fs::remove_file(&installer_path);
+            return Err("WireGuard silent install failed. Please install manually from https://www.wireguard.com/install/".to_string());
+        }
+
+        // Clean up installer
+        let _ = std::fs::remove_file(&installer_path);
+        eprintln!("[wg] Installed WireGuard via silent installer");
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let apt = Command::new("sudo")
+            .args(["apt-get", "install", "-y", "wireguard-tools"])
+            .output()
+            .map_err(|e| format!("Failed to install wireguard-tools: {}", e))?;
+        if !apt.status.success() {
+            let stderr = String::from_utf8_lossy(&apt.stderr);
+            return Err(format!("apt install wireguard-tools failed: {}. Please install manually.", stderr));
+        }
+        eprintln!("[wg] Installed wireguard-tools via apt");
+    }
+
+    Ok(())
+}
+
 /// Generate WG keypair, register with backend, write config, activate tunnel.
 /// Returns the assigned mesh IP on success.
 async fn setup_wireguard(dcp_dir: &std::path::Path, api_key: &str) -> Result<String, String> {
     let wg_conf_path = dcp_dir.join("wg0.conf");
+
+    // Step 0: Ensure WireGuard tools are installed (auto-install if missing)
+    eprintln!("[wg] Installing DCP network tools...");
+    if let Err(e) = ensure_wireguard_installed().await {
+        eprintln!("[wg] Auto-install failed: {}. Continuing — keypair generation will use fallback if available.", e);
+    }
 
     // If we already have a running WG interface, check if it's healthy
     #[cfg(unix)]
@@ -3625,7 +3713,7 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
     emit_wizard_progress(&window, WizardProgress {
         step_id: "tunnel".into(),
         status: "active".into(),
-        detail: Some("Setting up secure tunnel...".into()),
+        detail: Some("Installing DCP network tools...".into()),
         ..Default::default()
     });
     match setup_wireguard(&dcp_dir, &api_key).await {
@@ -3838,6 +3926,166 @@ async fn pre_install_speed_probe() -> SpeedProbeResult {
         None
     };
     SpeedProbeResult { mbps, sample_bytes, elapsed_ms }
+}
+
+// ── Network Status & Key Rotation Commands ──────────────────────────
+
+#[tauri::command]
+async fn get_network_status() -> Result<serde_json::Value, String> {
+    let dcp_dir = dcp_home()?;
+    let config_path = dcp_dir.join("config.json");
+
+    // Read wg_mesh_ip from config
+    let mesh_ip = if let Ok(content) = std::fs::read_to_string(&config_path) {
+        if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
+            config.get("wg_mesh_ip").and_then(|v| v.as_str()).map(|s| s.to_string())
+        } else { None }
+    } else { None };
+
+    // Check if WG interface is active
+    #[cfg(not(windows))]
+    let wg_active = Command::new("wg")
+        .args(["show", "wg0"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    #[cfg(windows)]
+    let wg_active = Command::new("wireguard")
+        .args(["/dumplog", "wg0"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    // Get latest handshake time if active
+    let handshake_secs: Option<u64> = if wg_active {
+        Command::new("wg")
+            .args(["show", "wg0", "latest-handshakes"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| s.split_whitespace().last().and_then(|t| t.parse::<u64>().ok()))
+    } else { None };
+
+    // Measure latency to VPS (10.8.0.1)
+    let latency_ms: Option<u64> = if wg_active {
+        let start = std::time::Instant::now();
+        let ping_args: Vec<&str> = if cfg!(windows) {
+            vec!["-n", "1", "-w", "2000", "10.8.0.1"]
+        } else {
+            vec!["-c", "1", "-W", "2", "10.8.0.1"]
+        };
+        let ping = Command::new("ping").args(&ping_args).output();
+        if let Ok(o) = ping {
+            if o.status.success() {
+                Some(start.elapsed().as_millis() as u64)
+            } else { None }
+        } else { None }
+    } else { None };
+
+    Ok(serde_json::json!({
+        "connected": wg_active,
+        "mesh_ip": mesh_ip,
+        "latency_ms": latency_ms,
+        "last_handshake_secs_ago": handshake_secs,
+    }))
+}
+
+#[tauri::command]
+async fn rotate_network_key() -> Result<String, String> {
+    let dcp_dir = dcp_home()?;
+
+    // Read API key from config
+    let api_key = load_api_key_from_config()
+        .map_err(|_| "No API key configured".to_string())?;
+
+    // 1. Generate new keypair
+    let (private_key, public_key) = generate_wg_keypair()?;
+
+    // 2. Deactivate current tunnel (ignore errors — may not be up)
+    #[cfg(not(windows))]
+    {
+        let conf_path = dcp_dir.join("wg0.conf");
+        let _ = Command::new("wg-quick")
+            .args(["down", &conf_path.to_string_lossy()])
+            .output();
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("wireguard")
+            .args(["/uninstalltunnelservice", "wg0"])
+            .output();
+    }
+
+    // 3. Register new key with backend (replaces old peer)
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .unwrap_or_default();
+
+    let resp = client
+        .post(format!("{}/wg/register", API_BASE))
+        .header("x-provider-key", &api_key)
+        .json(&serde_json::json!({ "public_key": public_key, "rotate": true }))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to register new key: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("Backend rejected key rotation: HTTP {} — {}", status, body));
+    }
+
+    let config: serde_json::Value = resp.json().await
+        .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+    let assigned_ip = config["ip"].as_str().unwrap_or("10.8.0.3");
+
+    // 4. Write new config with new private key
+    let wg_conf = format!(
+        "[Interface]\n\
+         PrivateKey = {}\n\
+         Address = {}/24\n\
+         \n\
+         [Peer]\n\
+         PublicKey = {}\n\
+         PresharedKey = {}\n\
+         Endpoint = {}\n\
+         AllowedIPs = 10.8.0.0/24\n\
+         PersistentKeepalive = 25\n",
+        private_key,
+        assigned_ip,
+        config["server_pubkey"].as_str().unwrap_or(""),
+        config["psk"].as_str().unwrap_or(""),
+        config["server_endpoint"].as_str().unwrap_or("76.13.179.86:51820"),
+    );
+
+    let conf_path = dcp_dir.join("wg0.conf");
+    std::fs::write(&conf_path, &wg_conf)
+        .map_err(|e| format!("Failed to write config: {}", e))?;
+
+    // Restrict permissions
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&conf_path,
+            std::fs::Permissions::from_mode(0o600));
+    }
+
+    // 5. Reactivate tunnel
+    activate_wireguard(&dcp_dir).await?;
+
+    // 6. Update wg_mesh_ip in config.json
+    let config_path = dcp_dir.join("config.json");
+    if let Ok(content) = std::fs::read_to_string(&config_path) {
+        if let Ok(mut cfg) = serde_json::from_str::<serde_json::Value>(&content) {
+            cfg["wg_mesh_ip"] = serde_json::Value::String(assigned_ip.to_string());
+            let _ = std::fs::write(&config_path, serde_json::to_string_pretty(&cfg).unwrap_or_default());
+        }
+    }
+
+    Ok(format!("Key rotated. Mesh IP: {}", assigned_ip))
 }
 
 // ── App Entry ────────────────────────────────────────────────────────
@@ -4176,6 +4424,8 @@ pub fn run() {
             full_start_provider,
             get_model_metadata,
             pre_install_speed_probe,
+            get_network_status,
+            rotate_network_key,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
