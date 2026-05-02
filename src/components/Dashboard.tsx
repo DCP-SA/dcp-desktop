@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from "react";
-import { detectGpu, formatVram, fetchDashboard, fetchMetrics, fetchRecentJobs, pauseProvider, resumeProvider, readConfig, startDaemonProcess, stopDaemonProcess, getDaemonStatus, checkDaemonHealth, getLiveMetrics, fullStartProvider, getNetworkStatus, rotateNetworkKey } from "../lib/api";
+import { detectGpu, formatVram, fetchDashboard, fetchMetrics, fetchRecentJobs, pauseProvider, resumeProvider, readConfig, startDaemonProcess, stopDaemonProcess, getDaemonStatus, checkDaemonHealth, getLiveMetrics, fullStartProvider, getNetworkStatus, rotateNetworkKey, reconnectNetwork } from "../lib/api";
 import type { NetworkStatus } from "../lib/api";
 import type { GpuInfo, DaemonConfig, ProviderDashboard, ProviderMetrics, JobEntry as ApiJobEntry, SavedConfig, LiveMetrics, HealthReport, DaemonStatus as DaemonStatusType } from "../lib/api";
 import { Gauge } from "./Gauge";
@@ -563,6 +563,7 @@ export function Dashboard() {
   // ── Network Status State & Polling ─────────────────────────────────
   const [network, setNetwork] = useState<NetworkStatus | null>(null);
   const [networkRotating, setNetworkRotating] = useState(false);
+  const [networkReconnecting, setNetworkReconnecting] = useState(false);
 
   useEffect(() => {
     const poll = async () => {
@@ -1179,13 +1180,21 @@ export function Dashboard() {
           <div style={{display: 'flex', gap: 8, marginTop: 12}}>
             {!network?.connected && (
               <button className="btn btn-secondary" style={{flex: 1}}
+                disabled={networkReconnecting}
                 onClick={async () => {
+                  setNetworkReconnecting(true);
                   try {
+                    await reconnectNetwork();
+                    // Refresh network status after reconnect
                     const status = await getNetworkStatus();
                     setNetwork(status);
-                  } catch {}
+                  } catch (err) {
+                    console.error("Reconnect failed:", err);
+                  } finally {
+                    setNetworkReconnecting(false);
+                  }
                 }}>
-                Reconnect
+                {networkReconnecting ? 'Reconnecting...' : 'Reconnect'}
               </button>
             )}
             <button

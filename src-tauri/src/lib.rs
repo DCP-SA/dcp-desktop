@@ -2540,16 +2540,41 @@ async fn rollback_daemon() -> Result<String, String> {
 /// macOS: brew install wireguard-tools
 /// Windows: download and run the silent NSIS installer
 /// Linux: apt-get install wireguard-tools
-async fn ensure_wireguard_installed() -> Result<(), String> {
-    // Check if wg command exists
-    let check = Command::new(if cfg!(windows) { "where" } else { "which" })
-        .arg("wg")
-        .output();
-
-    if let Ok(output) = check {
-        if output.status.success() {
-            return Ok(()); // Already installed
+/// Return the path to `wg` binary, checking common locations.
+fn wg_bin() -> &'static str {
+    // Tauri apps don't inherit shell PATH on macOS — check known locations
+    for candidate in &["/opt/homebrew/bin/wg", "/usr/local/bin/wg", "/usr/bin/wg"] {
+        if std::path::Path::new(candidate).exists() {
+            // Leak a &'static str from the first match (one-time)
+            return match *candidate {
+                "/opt/homebrew/bin/wg" => "/opt/homebrew/bin/wg",
+                "/usr/local/bin/wg" => "/usr/local/bin/wg",
+                _ => "/usr/bin/wg",
+            };
         }
+    }
+    "wg" // fallback to PATH lookup
+}
+
+fn wg_quick_bin() -> &'static str {
+    for candidate in &["/opt/homebrew/bin/wg-quick", "/usr/local/bin/wg-quick", "/usr/bin/wg-quick"] {
+        if std::path::Path::new(candidate).exists() {
+            return match *candidate {
+                "/opt/homebrew/bin/wg-quick" => "/opt/homebrew/bin/wg-quick",
+                "/usr/local/bin/wg-quick" => "/usr/local/bin/wg-quick",
+                _ => "/usr/bin/wg-quick",
+            };
+        }
+    }
+    "wg-quick"
+}
+
+async fn ensure_wireguard_installed() -> Result<(), String> {
+    // Check if wg command exists at known paths
+    let wg = wg_bin();
+    if std::path::Path::new(wg).exists() || Command::new(wg).arg("--version").output().map(|o| o.status.success()).unwrap_or(false) {
+        eprintln!("[wg] WireGuard found at {}", wg);
+        return Ok(());
     }
 
     eprintln!("[wg] WireGuard tools not found, attempting auto-install...");
@@ -2557,7 +2582,12 @@ async fn ensure_wireguard_installed() -> Result<(), String> {
     // Auto-install based on platform
     #[cfg(target_os = "macos")]
     {
-        let brew = Command::new("brew")
+        let brew_path = if std::path::Path::new("/opt/homebrew/bin/brew").exists() {
+            "/opt/homebrew/bin/brew"
+        } else {
+            "brew"
+        };
+        let brew = Command::new(brew_path)
             .args(["install", "wireguard-tools"])
             .output()
             .map_err(|e| format!("Failed to install WireGuard via brew: {}. Please install from https://www.wireguard.com/install/", e))?;
@@ -2632,7 +2662,7 @@ async fn setup_wireguard(dcp_dir: &std::path::Path, api_key: &str) -> Result<Str
     // If we already have a running WG interface, check if it's healthy
     #[cfg(unix)]
     {
-        let check = Command::new("wg").args(["show", "wg0"]).output();
+        let check = Command::new(wg_bin()).args(["show", "wg0"]).output();
         if let Ok(o) = check {
             if o.status.success() {
                 let output = String::from_utf8_lossy(&o.stdout);
@@ -2779,13 +2809,13 @@ async fn setup_wireguard(dcp_dir: &std::path::Path, api_key: &str) -> Result<Str
 /// falls back to pure-Rust x25519 if wg tools are not installed.
 fn generate_wg_keypair() -> Result<(String, String), String> {
     // Try using wg tools (available if WireGuard is installed)
-    let genkey_result = Command::new("wg").arg("genkey").output();
+    let genkey_result = Command::new(wg_bin()).arg("genkey").output();
     if let Ok(output) = genkey_result {
         if output.status.success() {
             let private_key = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if !private_key.is_empty() {
                 // Derive public key
-                let mut pubkey_cmd = Command::new("wg");
+                let mut pubkey_cmd = Command::new(wg_bin());
                 pubkey_cmd.arg("pubkey");
                 pubkey_cmd.stdin(std::process::Stdio::piped());
                 pubkey_cmd.stdout(std::process::Stdio::piped());
@@ -2826,29 +2856,51 @@ async fn activate_wireguard(dcp_dir: &std::path::Path) -> Result<(), String> {
     }
 
     // First, bring down any existing wg0 interface (ignore errors — it may not be up)
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     {
-        let _ = Command::new("wg-quick").args(["down", &wg_conf_path.to_string_lossy()]).output();
+        let _ = Command::new(wg_quick_bin()).args(["down", &wg_conf_path.to_string_lossy()]).output();
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
+    // On macOS, down+up are combined below to avoid two admin password prompts.
 
     // Platform-specific activation
     #[cfg(target_os = "macos")]
     {
-        // macOS: wg-quick up requires the conf file path
-        let up_result = Command::new("wg-quick")
-            .args(["up", &wg_conf_path.to_string_lossy()])
-            .output();
+        // macOS: wg-quick up/down require root. Use osascript to show a native
+        // macOS admin password dialog — no terminal needed. We combine down+up
+        // into a single admin prompt so the user only enters their password once.
+        let wq = wg_quick_bin();
+        let conf = wg_conf_path.to_string_lossy().to_string();
+
+        // First try without sudo (works if user already has passwordless sudo)
+        let up_result = Command::new(wq).args(["up", &conf]).output();
         match up_result {
             Ok(output) if output.status.success() => return Ok(()),
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                // If it failed because we need sudo, try with sudo
-                if stderr.contains("Permission denied") || stderr.contains("Operation not permitted") {
-                    eprintln!("[wg] wg-quick needs elevated permissions on macOS");
-                    return Err(format!("WireGuard needs sudo. Run: sudo wg-quick up {}", wg_conf_path.display()));
+            Ok(_output) => {
+                // Needs root — use osascript admin prompt (native macOS dialog)
+                // Combine down + sleep + up in a single privileged shell script
+                eprintln!("[wg] wg-quick needs elevated permissions, using macOS admin prompt...");
+                let shell_cmd = format!(
+                    "{wq} down {conf} 2>/dev/null; sleep 0.5; {wq} up {conf}",
+                    wq = wq, conf = conf
+                ).replace('\"', "\\\"");
+                let osa_result = Command::new("osascript")
+                    .args(["-e", &format!(
+                        "do shell script \"{}\" with administrator privileges",
+                        shell_cmd
+                    )])
+                    .output();
+                match osa_result {
+                    Ok(o) if o.status.success() => return Ok(()),
+                    Ok(o) => {
+                        let stderr = String::from_utf8_lossy(&o.stderr);
+                        if stderr.contains("User canceled") || stderr.contains("canceled") {
+                            return Err("WireGuard setup cancelled — admin password required to activate the tunnel.".to_string());
+                        }
+                        return Err(format!("wg-quick up failed (admin): {}", stderr));
+                    }
+                    Err(e) => return Err(format!("osascript admin prompt failed: {}", e)),
                 }
-                return Err(format!("wg-quick up failed: {}", stderr));
             }
             Err(e) => {
                 if e.kind() == std::io::ErrorKind::NotFound {
@@ -2861,7 +2913,7 @@ async fn activate_wireguard(dcp_dir: &std::path::Path) -> Result<(), String> {
 
     #[cfg(target_os = "linux")]
     {
-        let up_result = Command::new("wg-quick")
+        let up_result = Command::new(wg_quick_bin())
             .args(["up", &wg_conf_path.to_string_lossy()])
             .output();
         match up_result {
@@ -3944,7 +3996,7 @@ async fn get_network_status() -> Result<serde_json::Value, String> {
 
     // Check if WG interface is active
     #[cfg(not(windows))]
-    let wg_active = Command::new("wg")
+    let wg_active = Command::new(wg_bin())
         .args(["show", "wg0"])
         .output()
         .map(|o| o.status.success())
@@ -3959,7 +4011,7 @@ async fn get_network_status() -> Result<serde_json::Value, String> {
 
     // Get latest handshake time if active
     let handshake_secs: Option<u64> = if wg_active {
-        Command::new("wg")
+        Command::new(wg_bin())
             .args(["show", "wg0", "latest-handshakes"])
             .output()
             .ok()
@@ -4006,7 +4058,7 @@ async fn rotate_network_key() -> Result<String, String> {
     #[cfg(not(windows))]
     {
         let conf_path = dcp_dir.join("wg0.conf");
-        let _ = Command::new("wg-quick")
+        let _ = Command::new(wg_quick_bin())
             .args(["down", &conf_path.to_string_lossy()])
             .output();
     }
@@ -4086,6 +4138,16 @@ async fn rotate_network_key() -> Result<String, String> {
     }
 
     Ok(format!("Key rotated. Mesh IP: {}", assigned_ip))
+}
+
+/// Reconnect WireGuard tunnel — called from the Dashboard "Reconnect" button.
+/// Re-runs the full WG setup: ensure installed, register key, write config, activate.
+#[tauri::command]
+async fn reconnect_network() -> Result<String, String> {
+    let dcp_dir = dcp_home()?;
+    let api_key = load_api_key_from_config()
+        .map_err(|_| "No API key configured. Complete setup first.".to_string())?;
+    setup_wireguard(&dcp_dir, &api_key).await
 }
 
 // ── App Entry ────────────────────────────────────────────────────────
@@ -4426,6 +4488,7 @@ pub fn run() {
             pre_install_speed_probe,
             get_network_status,
             rotate_network_key,
+            reconnect_network,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

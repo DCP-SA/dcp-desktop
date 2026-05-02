@@ -295,3 +295,7 @@ export async function getNetworkStatus(): Promise<NetworkStatus> {
 export async function rotateNetworkKey(): Promise<string> {
   return invoke<string>("rotate_network_key");
 }
+
+export async function reconnectNetwork(): Promise<string> {
+  return invoke<string>("reconnect_network");
+}
