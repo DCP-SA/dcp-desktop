@@ -1156,7 +1156,7 @@ export function Dashboard() {
                       const home = await homeDir();
                       const logPath = await join(home, '.dcp', 'startup.log');
                       const { open } = await import('@tauri-apps/plugin-shell');
-                      await open(logPath);
+                      await open('file://' + logPath);
                     } catch { /* ignore — file may not exist */ }
                   }}>
                   View Install Log
