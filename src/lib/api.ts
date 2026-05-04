@@ -99,6 +99,9 @@ export interface JobEntry {
   created_at: string;
   completed_at: string;
   provider_earned_halala: number;
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  duration_seconds?: number;
 }
 
 export interface SavedConfig {

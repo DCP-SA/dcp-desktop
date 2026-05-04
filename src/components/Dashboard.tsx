@@ -502,12 +502,13 @@ export function Dashboard() {
                 timestamp = ts;
               }
 
+              const jobTokens = (job.prompt_tokens || 0) + (job.completion_tokens || 0);
               newEntries.push({
                 id: job.job_id,
                 timestamp,
                 model: job.model,
-                tokens: 0,
-                latency: "",
+                tokens: jobTokens,
+                latency: job.duration_seconds ? `${job.duration_seconds}s` : "",
                 earned: (job.provider_earned_halala / 100).toFixed(4),
               });
             }
@@ -1027,7 +1028,7 @@ export function Dashboard() {
               <span className="impact-box-value">
                 <AnimatedCounter target={performance.jobsCompleted} />
               </span>
-              <span className="impact-box-label">requests served today</span>
+              <span className="impact-box-label">requests served</span>
             </div>
             <div className="impact-box">
               <span className="impact-box-value">
