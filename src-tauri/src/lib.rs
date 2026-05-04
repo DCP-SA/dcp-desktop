@@ -1942,7 +1942,66 @@ async fn check_daemon_health() -> Result<HealthReport, String> {
         }
     }
 
-    // 10. Sufficient disk space?
+    // 10. Internet speed probe (download 2 MB sample and measure throughput)
+    {
+        let speed_url = "https://github.com/ollama/ollama/releases/latest/download/OllamaSetup.exe";
+        let speed_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(8))
+            .build()
+            .unwrap_or_default();
+        let speed_start = std::time::Instant::now();
+        let speed_result = speed_client.get(speed_url)
+            .header("Range", "bytes=0-2097151")
+            .send().await;
+        match speed_result {
+            Ok(resp) => {
+                match resp.bytes().await {
+                    Ok(bytes) => {
+                        let elapsed_s = speed_start.elapsed().as_secs_f64();
+                        if elapsed_s > 0.01 {
+                            let mbps = (bytes.len() as f64) / elapsed_s / 1_048_576.0;
+                            let (status, msg) = if mbps >= 10.0 {
+                                ("ok", format!("{:.1} MB/s — excellent", mbps))
+                            } else if mbps >= 2.0 {
+                                ("ok", format!("{:.1} MB/s — adequate for model downloads", mbps))
+                            } else if mbps >= 0.5 {
+                                ("warning", format!("{:.1} MB/s — slow, model downloads will take a long time", mbps))
+                            } else {
+                                ("error", format!("{:.2} MB/s — very slow, model downloads may fail or timeout", mbps))
+                            };
+                            checks.push(HealthCheck {
+                                name: "Internet Speed".to_string(),
+                                status: status.to_string(),
+                                message: msg,
+                                can_auto_fix: false,
+                                fix_action: None,
+                            });
+                        }
+                    }
+                    Err(_) => {
+                        checks.push(HealthCheck {
+                            name: "Internet Speed".to_string(),
+                            status: "warning".to_string(),
+                            message: "Speed probe failed — could not read response".to_string(),
+                            can_auto_fix: false,
+                            fix_action: None,
+                        });
+                    }
+                }
+            }
+            Err(_) => {
+                checks.push(HealthCheck {
+                    name: "Internet Speed".to_string(),
+                    status: "warning".to_string(),
+                    message: "Speed probe failed — could not connect".to_string(),
+                    can_auto_fix: false,
+                    fix_action: None,
+                });
+            }
+        }
+    }
+
+    // 11. Sufficient disk space?
     #[cfg(target_os = "macos")]
     {
         let df_output = Command::new("df")
@@ -3063,6 +3122,13 @@ done
 #[tauri::command]
 async fn full_start_provider(window: tauri::Window, api_key: String, state: State<'_, DaemonManager>) -> Result<String, String> {
     let dcp_dir = dcp_home()?;
+    let result = full_start_provider_inner(&window, &api_key, &state, &dcp_dir).await;
+    // Upload logs on EVERY exit path — success or failure
+    upload_provider_logs(&api_key, &dcp_dir).await;
+    result
+}
+
+async fn full_start_provider_inner(window: &tauri::Window, api_key: &str, state: &State<'_, DaemonManager>, dcp_dir: &std::path::Path) -> Result<String, String> {
 
     // Write startup log for debugging provider issues
     let startup_log_path = dcp_dir.join("startup.log");
@@ -3091,7 +3157,7 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
     }
     log_startup!("=== END SNAPSHOT ===");
 
-    emit_wizard_progress(&window, WizardProgress {
+    emit_wizard_progress(window, WizardProgress {
         step_id: "snapshot".into(),
         status: "done".into(),
         detail: Some(format!("{} {} — v0.2.8", std::env::consts::OS, std::env::consts::ARCH)),
@@ -3243,28 +3309,28 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
                 } else { None })
                 .unwrap_or_else(|| "latest".to_string());
 
-            emit_wizard_progress(&window, WizardProgress {
+            emit_wizard_progress(window, WizardProgress {
                 step_id: "ollama_download".into(),
                 status: "active".into(),
                 detail: Some(format!("Checking MLX inference engine v{}...", mlx_version)),
                 ..Default::default()
             });
             tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-            emit_wizard_progress(&window, WizardProgress {
+            emit_wizard_progress(window, WizardProgress {
                 step_id: "ollama_download".into(),
                 status: "done".into(),
                 detail: Some(format!("MLX inference engine v{} — already installed", mlx_version)),
                 ..Default::default()
             });
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            emit_wizard_progress(&window, WizardProgress {
+            emit_wizard_progress(window, WizardProgress {
                 step_id: "ollama_install".into(),
                 status: "active".into(),
                 detail: Some("Verifying engine...".into()),
                 ..Default::default()
             });
             tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-            emit_wizard_progress(&window, WizardProgress {
+            emit_wizard_progress(window, WizardProgress {
                 step_id: "ollama_install".into(),
                 status: "done".into(),
                 detail: Some("No installation needed".into()),
@@ -3293,28 +3359,28 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
 
         if ollama_serving {
             log_startup!("Step 2: Ollama already running on :11434, skipping install");
-            emit_wizard_progress(&window, WizardProgress {
+            emit_wizard_progress(window, WizardProgress {
                 step_id: "ollama_download".into(),
                 status: "active".into(),
                 detail: Some("Checking Ollama installation...".into()),
                 ..Default::default()
             });
             tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-            emit_wizard_progress(&window, WizardProgress {
+            emit_wizard_progress(window, WizardProgress {
                 step_id: "ollama_download".into(),
                 status: "done".into(),
                 detail: Some("Ollama already installed".into()),
                 ..Default::default()
             });
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            emit_wizard_progress(&window, WizardProgress {
+            emit_wizard_progress(window, WizardProgress {
                 step_id: "ollama_install".into(),
                 status: "active".into(),
                 detail: Some("Verifying Ollama service...".into()),
                 ..Default::default()
             });
             tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-            emit_wizard_progress(&window, WizardProgress {
+            emit_wizard_progress(window, WizardProgress {
                 step_id: "ollama_install".into(),
                 status: "done".into(),
                 detail: Some("Ollama running on port 11434".into()),
@@ -3400,7 +3466,7 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
                         // Download OllamaSetup.exe directly — works on all
                         // Windows 10+ without winget.
                         log_startup!("Step 2: Downloading OllamaSetup.exe (~1.85 GB)");
-                        emit_wizard_progress(&window, WizardProgress {
+                        emit_wizard_progress(window, WizardProgress {
                             step_id: "ollama_download".into(),
                             status: "active".into(),
                             detail: Some("Starting Ollama download (~1.85 GB)".into()),
@@ -3430,7 +3496,7 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
                                     let remaining = t.saturating_sub(downloaded) as f64;
                                     if mbps > 0.0 { Some((remaining * 8.0 / (mbps * 1_000_000.0)) as u64) } else { None }
                                 });
-                                emit_wizard_progress(&window, WizardProgress {
+                                emit_wizard_progress(window, WizardProgress {
                                     step_id: "ollama_download".into(),
                                     status: "active".into(),
                                     pct,
@@ -3443,7 +3509,7 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
                                 last_emit = std::time::Instant::now();
                             }
                         }
-                        emit_wizard_progress(&window, WizardProgress {
+                        emit_wizard_progress(window, WizardProgress {
                             step_id: "ollama_download".into(),
                             status: "done".into(),
                             detail: Some("Ollama installer downloaded".into()),
@@ -3452,7 +3518,7 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
                         chosen_installer = installer_path.clone();
                     }
 
-                    emit_wizard_progress(&window, WizardProgress {
+                    emit_wizard_progress(window, WizardProgress {
                         step_id: "ollama_install".into(),
                         status: "active".into(),
                         detail: Some("Running Ollama installer (silent)".into()),
@@ -3498,7 +3564,7 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
                             "Ollama installer ran but daemon did not start within 30s; check Windows Defender quarantine or try manual install".to_string(),
                         );
                     }
-                    emit_wizard_progress(&window, WizardProgress {
+                    emit_wizard_progress(window, WizardProgress {
                         step_id: "ollama_install".into(),
                         status: "done".into(),
                         detail: Some("Ollama running on :11434".into()),
@@ -3507,28 +3573,28 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
                 }
             } else {
                 log_startup!("Step 2: Ollama binary found, skipping download/install");
-                emit_wizard_progress(&window, WizardProgress {
+                emit_wizard_progress(window, WizardProgress {
                     step_id: "ollama_download".into(),
                     status: "active".into(),
                     detail: Some("Checking Ollama installation...".into()),
                     ..Default::default()
                 });
                 tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-                emit_wizard_progress(&window, WizardProgress {
+                emit_wizard_progress(window, WizardProgress {
                     step_id: "ollama_download".into(),
                     status: "done".into(),
                     detail: Some("Ollama already installed".into()),
                     ..Default::default()
                 });
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                emit_wizard_progress(&window, WizardProgress {
+                emit_wizard_progress(window, WizardProgress {
                     step_id: "ollama_install".into(),
                     status: "active".into(),
                     detail: Some("Starting Ollama service...".into()),
                     ..Default::default()
                 });
                 tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-                emit_wizard_progress(&window, WizardProgress {
+                emit_wizard_progress(window, WizardProgress {
                     step_id: "ollama_install".into(),
                     status: "done".into(),
                     detail: Some("Ollama running on port 11434".into()),
@@ -3589,14 +3655,14 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
         };
         if model_cached {
             log_startup!("Step 3: MLX model {} already cached in HF cache", model);
-            emit_wizard_progress(&window, WizardProgress {
+            emit_wizard_progress(window, WizardProgress {
                 step_id: "model_download".into(),
                 status: "active".into(),
                 detail: Some(format!("Checking {} cache...", mlx_display_name)),
                 ..Default::default()
             });
             tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-            emit_wizard_progress(&window, WizardProgress {
+            emit_wizard_progress(window, WizardProgress {
                 step_id: "model_download".into(),
                 status: "done".into(),
                 detail: Some(format!("{} ({}) — cached",
@@ -3606,14 +3672,14 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
                 ..Default::default()
             });
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            emit_wizard_progress(&window, WizardProgress {
+            emit_wizard_progress(window, WizardProgress {
                 step_id: "model_verify".into(),
                 status: "active".into(),
                 detail: Some("Verifying model files...".into()),
                 ..Default::default()
             });
             tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-            emit_wizard_progress(&window, WizardProgress {
+            emit_wizard_progress(window, WizardProgress {
                 step_id: "model_verify".into(),
                 status: "done".into(),
                 detail: Some("Model verified and ready".into()),
@@ -3622,7 +3688,7 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         } else {
             // Download MLX model explicitly with progress reporting before starting server
-            emit_wizard_progress(&window, WizardProgress {
+            emit_wizard_progress(window, WizardProgress {
                 step_id: "model_download".into(),
                 status: "active".into(),
                 detail: Some(format!("Downloading {} from HuggingFace...", mlx_display_name)),
@@ -3643,18 +3709,161 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
 
             match dl_result {
                 Ok(mut dl_child) => {
-                    // Stream stderr for progress
+                    // Stream stderr for progress — huggingface_hub outputs lines like:
+                    // "Downloading model.safetensors: 45%|████ | 1.8G/4.0G [02:30<03:00, 12.3MB/s]"
                     if let Some(stderr) = dl_child.stderr.take() {
                         use std::io::{BufRead, BufReader};
                         let window_clone = window.clone();
                         let mut last_emit = std::time::Instant::now();
+                        let mut mlx_slow_since: Option<std::time::Instant> = None;
+                        let mut mlx_slow_warned = false;
                         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
                             log_startup!("[mlx-dl] {}", line);
                             if last_emit.elapsed().as_millis() >= 500 {
+                                // Parse HF progress: "45%|████ | 1.8G/4.0G [02:30<03:00, 12.3MB/s]"
+                                let hf_pct = line.find('%').and_then(|idx| {
+                                    let before = &line[..idx];
+                                    let start = before.rfind(|c: char| !c.is_ascii_digit() && c != '.').map(|i| i + 1).unwrap_or(0);
+                                    before[start..].parse::<f32>().ok()
+                                });
+
+                                // Parse speed: "12.3MB/s" or "12.3MB/s]"
+                                let hf_speed: Option<f64> = {
+                                    let mut result = None;
+                                    if let Some(idx) = line.find("MB/s") {
+                                        let before = &line[..idx];
+                                        // Walk back past spaces/commas to find the number
+                                        let trimmed = before.trim_end_matches(|c: char| c == ',' || c == ' ');
+                                        let start = trimmed.rfind(|c: char| !c.is_ascii_digit() && c != '.').map(|i| i + 1).unwrap_or(0);
+                                        if let Ok(v) = trimmed[start..].parse::<f64>() { result = Some(v); }
+                                    } else if let Some(idx) = line.find("GB/s") {
+                                        let before = &line[..idx];
+                                        let trimmed = before.trim_end_matches(|c: char| c == ',' || c == ' ');
+                                        let start = trimmed.rfind(|c: char| !c.is_ascii_digit() && c != '.').map(|i| i + 1).unwrap_or(0);
+                                        if let Ok(v) = trimmed[start..].parse::<f64>() { result = Some(v * 1024.0); }
+                                    }
+                                    result
+                                };
+
+                                // Parse done/total: "1.8G/4.0G" or "500M/2.0G"
+                                let (hf_mb_done, hf_mb_total) = {
+                                    let mut done: Option<f64> = None;
+                                    let mut total: Option<f64> = None;
+                                    // Look for the pipe-separated section with sizes
+                                    if let Some(pipe_idx) = line.find('|') {
+                                        let after_pipe = &line[pipe_idx..];
+                                        if let Some(slash_idx) = after_pipe.find('/') {
+                                            let abs_slash = pipe_idx + slash_idx;
+                                            // Done: number+unit before slash
+                                            let before_slash = &line[pipe_idx..abs_slash];
+                                            let bs = before_slash.trim_start_matches('|').trim();
+                                            if let Some(g_pos) = bs.rfind('G') {
+                                                let chunk = &bs[..g_pos].trim();
+                                                let start = chunk.rfind(|c: char| !c.is_ascii_digit() && c != '.').map(|i| i + 1).unwrap_or(0);
+                                                if let Ok(v) = chunk[start..].parse::<f64>() { done = Some(v * 1024.0); }
+                                            } else if let Some(m_pos) = bs.rfind('M') {
+                                                let chunk = &bs[..m_pos].trim();
+                                                let start = chunk.rfind(|c: char| !c.is_ascii_digit() && c != '.').map(|i| i + 1).unwrap_or(0);
+                                                if let Ok(v) = chunk[start..].parse::<f64>() { done = Some(v); }
+                                            }
+                                            // Total: number+unit after slash
+                                            let after_slash = &line[abs_slash + 1..];
+                                            let at = after_slash.trim_start();
+                                            if let Some(g_pos) = at.find('G') {
+                                                if let Ok(v) = at[..g_pos].trim().parse::<f64>() { total = Some(v * 1024.0); }
+                                            } else if let Some(m_pos) = at.find('M') {
+                                                if let Ok(v) = at[..m_pos].trim().parse::<f64>() { total = Some(v); }
+                                            }
+                                        }
+                                    }
+                                    (done, total)
+                                };
+
+                                // Parse ETA: "[02:30<03:00, ...]" — take the part after '<'
+                                let hf_eta: Option<u64> = {
+                                    let mut result = None;
+                                    if let Some(lt_idx) = line.find('<') {
+                                        let after = &line[lt_idx + 1..];
+                                        // Format: "03:00" or "1:23:45"
+                                        let end = after.find(|c: char| c == ',' || c == ']' || c == ' ').unwrap_or(after.len());
+                                        let time_str = &after[..end];
+                                        let parts: Vec<&str> = time_str.split(':').collect();
+                                        match parts.len() {
+                                            2 => {
+                                                let m = parts[0].parse::<u64>().unwrap_or(0);
+                                                let s = parts[1].parse::<u64>().unwrap_or(0);
+                                                result = Some(m * 60 + s);
+                                            }
+                                            3 => {
+                                                let h = parts[0].parse::<u64>().unwrap_or(0);
+                                                let m = parts[1].parse::<u64>().unwrap_or(0);
+                                                let s = parts[2].parse::<u64>().unwrap_or(0);
+                                                result = Some(h * 3600 + m * 60 + s);
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    result
+                                };
+
+                                // Build rich detail string
+                                let detail = if hf_pct.is_some() || hf_speed.is_some() {
+                                    let pct_str = hf_pct.map(|p| format!("{:.0}%", p)).unwrap_or_default();
+                                    let size_str = match (hf_mb_done, hf_mb_total) {
+                                        (Some(d), Some(t)) => {
+                                            if t >= 1024.0 { format!(" ({:.1}/{:.1} GB)", d / 1024.0, t / 1024.0) }
+                                            else { format!(" ({:.0}/{:.0} MB)", d, t) }
+                                        }
+                                        _ => String::new(),
+                                    };
+                                    let speed_part = hf_speed.map(|s| format!(" at {:.1} MB/s", s)).unwrap_or_default();
+                                    let eta_part = hf_eta.map(|s| {
+                                        if s >= 3600 { format!(" -- ETA {}h{:02}m", s / 3600, (s % 3600) / 60) }
+                                        else if s >= 60 { format!(" -- ETA {}m{:02}s", s / 60, s % 60) }
+                                        else { format!(" -- ETA {}s", s) }
+                                    }).unwrap_or_default();
+                                    format!("Downloading {} -- {}{}{}{}", mlx_display_name, pct_str, size_str, speed_part, eta_part)
+                                } else {
+                                    // Non-progress line (e.g. "Fetching 12 files...")
+                                    line.chars().take(120).collect()
+                                };
+
+                                // Slow-speed warning for MLX downloads
+                                if let Some(spd) = hf_speed {
+                                    if spd < 2.0 {
+                                        match mlx_slow_since {
+                                            None => { mlx_slow_since = Some(std::time::Instant::now()); }
+                                            Some(since) if since.elapsed().as_secs() >= 30 && !mlx_slow_warned => {
+                                                mlx_slow_warned = true;
+                                                log_startup!("[mlx-dl] Slow download warning: {:.1} MB/s", spd);
+                                                emit_wizard_progress(&window_clone, WizardProgress {
+                                                    step_id: "model_download".into(),
+                                                    status: "active".into(),
+                                                    pct: hf_pct,
+                                                    mbps: Some(spd),
+                                                    detail: Some(format!(
+                                                        "Slow download detected ({:.1} MB/s). This may take a while on your connection.",
+                                                        spd
+                                                    )),
+                                                    ..Default::default()
+                                                });
+                                            }
+                                            _ => {}
+                                        }
+                                    } else {
+                                        mlx_slow_since = None;
+                                    }
+                                }
+
                                 emit_wizard_progress(&window_clone, WizardProgress {
                                     step_id: "model_download".into(),
                                     status: "active".into(),
-                                    detail: Some(line.chars().take(120).collect()),
+                                    pct: hf_pct,
+                                    mb_done: hf_mb_done,
+                                    mb_total: hf_mb_total,
+                                    mbps: hf_speed,
+                                    eta_seconds: hf_eta,
+                                    detail: Some(detail),
                                     ..Default::default()
                                 });
                                 last_emit = std::time::Instant::now();
@@ -3664,13 +3873,13 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
                     match dl_child.wait() {
                         Ok(exit) if exit.success() => {
                             log_startup!("Step 3a: MLX model download completed successfully");
-                            emit_wizard_progress(&window, WizardProgress {
+                            emit_wizard_progress(window, WizardProgress {
                                 step_id: "model_download".into(),
                                 status: "done".into(),
                                 detail: Some(format!("{} downloaded", mlx_display_name)),
                                 ..Default::default()
                             });
-                            emit_wizard_progress(&window, WizardProgress {
+                            emit_wizard_progress(window, WizardProgress {
                                 step_id: "model_verify".into(),
                                 status: "done".into(),
                                 detail: Some("Model verified and ready".into()),
@@ -3708,13 +3917,13 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
 
         // Emit final model step status for MLX (server spawned — model loads in background)
         if !model_cached {
-            emit_wizard_progress(&window, WizardProgress {
+            emit_wizard_progress(window, WizardProgress {
                 step_id: "model_download".into(),
                 status: "done".into(),
                 detail: Some(format!("{} loading via MLX server", model)),
                 ..Default::default()
             });
-            emit_wizard_progress(&window, WizardProgress {
+            emit_wizard_progress(window, WizardProgress {
                 step_id: "model_verify".into(),
                 status: "done".into(),
                 detail: Some("MLX server started".into()),
@@ -3804,10 +4013,52 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
             .unwrap_or(false);
 
         if !model_cached {
-            emit_wizard_progress(&window, WizardProgress {
+            // ── Pre-download speed estimate ──────────────────────────
+            let model_size_gb_est: f64 = {
+                let mut sz = 4.0_f64; // fallback guess
+                for (id, _, size) in MODEL_METADATA {
+                    if *id == model { sz = *size; break; }
+                }
+                sz
+            };
+            {
+                let probe_url = "https://github.com/ollama/ollama/releases/latest/download/OllamaSetup.exe";
+                let probe_client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(6))
+                    .build()
+                    .unwrap_or_default();
+                let probe_start = std::time::Instant::now();
+                if let Ok(resp) = probe_client.get(probe_url).header("Range", "bytes=0-2097151").send().await {
+                    if let Ok(bytes) = resp.bytes().await {
+                        let elapsed_s = probe_start.elapsed().as_secs_f64();
+                        if elapsed_s > 0.01 {
+                            let probe_mbps = (bytes.len() as f64) / elapsed_s / 1_048_576.0;
+                            let est_minutes = if probe_mbps > 0.1 {
+                                (model_size_gb_est * 1024.0) / (probe_mbps * 60.0)
+                            } else { 999.0 };
+                            log_startup!("Speed probe: {:.1} MB/s, model {:.1} GB, ETA {:.0} min", probe_mbps, model_size_gb_est, est_minutes);
+                            if est_minutes > 10.0 {
+                                emit_wizard_progress(window, WizardProgress {
+                                    step_id: "model_download".into(),
+                                    status: "active".into(),
+                                    mbps: Some(probe_mbps),
+                                    detail: Some(format!(
+                                        "Your download speed is {:.1} MB/s. Downloading {:.1} GB model will take approximately {:.0} minutes.",
+                                        probe_mbps, model_size_gb_est, est_minutes
+                                    )),
+                                    ..Default::default()
+                                });
+                                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                            }
+                        }
+                    }
+                }
+            }
+
+            emit_wizard_progress(window, WizardProgress {
                 step_id: "model_download".into(),
                 status: "active".into(),
-                detail: Some(format!("Pulling {}", model)),
+                detail: Some(format!("Pulling {} ({:.1} GB) from registry.ollama.ai", model, model_size_gb_est)),
                 ..Default::default()
             });
             use std::io::{BufRead, BufReader};
@@ -3819,6 +4070,8 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
             let stdout = child.stdout.take().ok_or_else(|| "no stdout pipe".to_string())?;
             let started = std::time::Instant::now();
             let mut last_emit = std::time::Instant::now();
+            let mut slow_since: Option<std::time::Instant> = None;
+            let mut slow_warned = false;
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
                 if last_emit.elapsed().as_millis() >= 250 {
                     // Parse percent using substring scan (no regex dep needed)
@@ -3827,11 +4080,155 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
                         let start = before.rfind(|c: char| !c.is_ascii_digit() && c != '.').map(|i| i + 1).unwrap_or(0);
                         before[start..].parse::<f32>().ok()
                     });
-                    emit_wizard_progress(&window, WizardProgress {
+
+                    // Parse speed: look for "X MB/s" or "X.Y MB/s"
+                    let speed_str: Option<(f64, String)> = {
+                        let mut result = None;
+                        if let Some(idx) = line.find("MB/s") {
+                            let before = line[..idx].trim_end();
+                            let start = before.rfind(|c: char| !c.is_ascii_digit() && c != '.').map(|i| i + 1).unwrap_or(0);
+                            if let Ok(val) = before[start..].parse::<f64>() {
+                                result = Some((val, format!("{:.0} MB/s", val)));
+                            }
+                        } else if let Some(idx) = line.find("GB/s") {
+                            let before = line[..idx].trim_end();
+                            let start = before.rfind(|c: char| !c.is_ascii_digit() && c != '.').map(|i| i + 1).unwrap_or(0);
+                            if let Ok(val) = before[start..].parse::<f64>() {
+                                result = Some((val * 1024.0, format!("{:.2} GB/s", val)));
+                            }
+                        }
+                        result
+                    };
+
+                    // Parse downloaded/total: look for "X.Y GB/Z.W GB" or "X MB/Y MB"
+                    let (mb_done, mb_total) = {
+                        let mut done: Option<f64> = None;
+                        let mut total: Option<f64> = None;
+                        // Pattern: "1.8 GB/4.0 GB"
+                        if let Some(slash_idx) = line.find('/') {
+                            // Parse total (after slash)
+                            let after = &line[slash_idx + 1..];
+                            let after_trimmed = after.trim_start();
+                            if let Some(gb_pos) = after_trimmed.find("GB") {
+                                if let Ok(v) = after_trimmed[..gb_pos].trim().parse::<f64>() {
+                                    total = Some(v * 1024.0);
+                                }
+                            } else if let Some(mb_pos) = after_trimmed.find("MB") {
+                                if let Ok(v) = after_trimmed[..mb_pos].trim().parse::<f64>() {
+                                    total = Some(v);
+                                }
+                            }
+                            // Parse done (before slash)
+                            let before = &line[..slash_idx];
+                            let before_trimmed = before.trim_end();
+                            // Walk backwards past the number and unit
+                            if let Some(gb_pos) = before_trimmed.rfind("GB") {
+                                // Number is between preceding non-digit and "GB"
+                                let chunk = &before_trimmed[..gb_pos].trim_end();
+                                let start = chunk.rfind(|c: char| !c.is_ascii_digit() && c != '.').map(|i| i + 1).unwrap_or(0);
+                                if let Ok(v) = chunk[start..].parse::<f64>() {
+                                    done = Some(v * 1024.0);
+                                }
+                            } else if let Some(mb_pos) = before_trimmed.rfind("MB") {
+                                let chunk = &before_trimmed[..mb_pos].trim_end();
+                                let start = chunk.rfind(|c: char| !c.is_ascii_digit() && c != '.').map(|i| i + 1).unwrap_or(0);
+                                if let Ok(v) = chunk[start..].parse::<f64>() {
+                                    done = Some(v);
+                                }
+                            } else {
+                                // Try bare number before slash (bytes?)
+                                let start = before_trimmed.rfind(|c: char| !c.is_ascii_digit() && c != '.').map(|i| i + 1).unwrap_or(0);
+                                if let Ok(v) = before_trimmed[start..].parse::<f64>() {
+                                    done = Some(v);
+                                }
+                            }
+                        }
+                        (done, total)
+                    };
+
+                    // Parse ETA: look for patterns like "2m53s", "53s", "1h2m"
+                    let eta_seconds: Option<u64> = {
+                        let mut result = None;
+                        // Ollama format: "Xm Ys" or "XmYs" at end of line
+                        let trimmed = line.trim_end();
+                        let last_token = trimmed.rsplit_once(|c: char| c.is_whitespace()).map(|(_, t)| t).unwrap_or(trimmed);
+                        let mut secs: u64 = 0;
+                        let mut num_buf = String::new();
+                        let mut found_unit = false;
+                        for ch in last_token.chars() {
+                            if ch.is_ascii_digit() {
+                                num_buf.push(ch);
+                            } else if ch == 'h' {
+                                if let Ok(n) = num_buf.parse::<u64>() { secs += n * 3600; found_unit = true; }
+                                num_buf.clear();
+                            } else if ch == 'm' {
+                                if let Ok(n) = num_buf.parse::<u64>() { secs += n * 60; found_unit = true; }
+                                num_buf.clear();
+                            } else if ch == 's' {
+                                if let Ok(n) = num_buf.parse::<u64>() { secs += n; found_unit = true; }
+                                num_buf.clear();
+                            }
+                        }
+                        if found_unit { result = Some(secs); }
+                        result
+                    };
+
+                    // Build rich detail string
+                    let speed_mbps = speed_str.as_ref().map(|(v, _)| *v);
+                    let detail = {
+                        let pct_str = pct.map(|p| format!("{:.0}%", p)).unwrap_or_default();
+                        let size_str = match (mb_done, mb_total) {
+                            (Some(d), Some(t)) => {
+                                if t >= 1024.0 { format!(" ({:.1}/{:.1} GB)", d / 1024.0, t / 1024.0) }
+                                else { format!(" ({:.0}/{:.0} MB)", d, t) }
+                            }
+                            _ => String::new(),
+                        };
+                        let speed_part = speed_str.as_ref().map(|(_, s)| format!(" at {}", s)).unwrap_or_default();
+                        let eta_part = eta_seconds.map(|s| {
+                            if s >= 3600 { format!(" -- ETA {}h{:02}m", s / 3600, (s % 3600) / 60) }
+                            else if s >= 60 { format!(" -- ETA {}m{:02}s", s / 60, s % 60) }
+                            else { format!(" -- ETA {}s", s) }
+                        }).unwrap_or_default();
+                        format!("Pulling {} -- {}{}{}{}", model, pct_str, size_str, speed_part, eta_part)
+                    };
+
+                    // Slow-speed warning
+                    if let Some(spd) = speed_mbps {
+                        if spd < 2.0 {
+                            match slow_since {
+                                None => { slow_since = Some(std::time::Instant::now()); }
+                                Some(since) if since.elapsed().as_secs() >= 30 && !slow_warned => {
+                                    slow_warned = true;
+                                    log_startup!("Slow download warning: {:.1} MB/s", spd);
+                                    emit_wizard_progress(window, WizardProgress {
+                                        step_id: "model_download".into(),
+                                        status: "active".into(),
+                                        pct,
+                                        mbps: Some(spd),
+                                        detail: Some(format!(
+                                            "Slow download detected ({:.1} MB/s). This may take a while on your connection.",
+                                            spd
+                                        )),
+                                        ..Default::default()
+                                    });
+                                }
+                                _ => {}
+                            }
+                        } else {
+                            slow_since = None;
+                        }
+                    }
+
+                    emit_wizard_progress(window, WizardProgress {
                         step_id: "model_download".into(),
                         status: "active".into(),
                         pct,
-                        detail: Some(line.chars().take(120).collect()),
+                        mb_done,
+                        mb_total,
+                        mbps: speed_mbps,
+                        eta_seconds,
+                        detail: Some(detail),
                         ..Default::default()
                     });
                     last_emit = std::time::Instant::now();
@@ -3840,7 +4237,7 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
             let status = child.wait().map_err(|e| format!("Model pull wait failed: {}", e))?;
             if !status.success() {
                 let _ = started; // suppress unused warning
-                emit_wizard_progress(&window, WizardProgress {
+                emit_wizard_progress(window, WizardProgress {
                     step_id: "model_download".into(),
                     status: "error".into(),
                     error: Some(format!("ollama pull {} exited non-zero", model)),
@@ -3848,7 +4245,7 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
                 });
                 return Err(format!("ollama pull {} failed", model));
             }
-            emit_wizard_progress(&window, WizardProgress {
+            emit_wizard_progress(window, WizardProgress {
                 step_id: "model_download".into(),
                 status: "done".into(),
                 detail: Some(format!("{} downloaded", model)),
@@ -3871,14 +4268,14 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
                 }
                 sz
             };
-            emit_wizard_progress(&window, WizardProgress {
+            emit_wizard_progress(window, WizardProgress {
                 step_id: "model_download".into(),
                 status: "active".into(),
                 detail: Some(format!("Checking {} cache...", ollama_display_name)),
                 ..Default::default()
             });
             tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-            emit_wizard_progress(&window, WizardProgress {
+            emit_wizard_progress(window, WizardProgress {
                 step_id: "model_download".into(),
                 status: "done".into(),
                 detail: Some(format!("{} ({}) — cached",
@@ -3888,14 +4285,14 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
                 ..Default::default()
             });
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            emit_wizard_progress(&window, WizardProgress {
+            emit_wizard_progress(window, WizardProgress {
                 step_id: "model_verify".into(),
                 status: "active".into(),
                 detail: Some("Verifying model files...".into()),
                 ..Default::default()
             });
             tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-            emit_wizard_progress(&window, WizardProgress {
+            emit_wizard_progress(window, WizardProgress {
                 step_id: "model_verify".into(),
                 status: "done".into(),
                 detail: Some("Model verified and ready".into()),
@@ -4018,7 +4415,7 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
     log_startup!("Step 3: Model ready — cached={}, engine running on port {}", model_cached, if engine == "mlx" { 8000 } else { 11434 });
 
     // Step 4: Download latest daemon with G19 sha256 verification (parity with update_daemon)
-    emit_wizard_progress(&window, WizardProgress {
+    emit_wizard_progress(window, WizardProgress {
         step_id: "daemon".into(),
         status: "active".into(),
         detail: Some("Downloading DCP daemon...".into()),
@@ -4159,7 +4556,7 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
 
     log_startup!("Step 4: Daemon started — PID={}", pid);
 
-    emit_wizard_progress(&window, WizardProgress {
+    emit_wizard_progress(window, WizardProgress {
         step_id: "daemon".into(),
         status: "done".into(),
         detail: Some(format!("Daemon v{} running (PID {})", daemon_version, pid)),
@@ -4171,16 +4568,16 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
     // WG tunnel lets the backend route inference traffic to the provider over
     // the 10.8.0.0/24 mesh. The daemon heartbeat also reports wg_mesh_ip so
     // v1.js prefers mesh routing over public vllm_endpoint_url.
-    emit_wizard_progress(&window, WizardProgress {
+    emit_wizard_progress(window, WizardProgress {
         step_id: "tunnel".into(),
         status: "active".into(),
         detail: Some("Connecting to DCP network...".into()),
         ..Default::default()
     });
-    match setup_wireguard(&dcp_dir, &api_key).await {
+    match setup_wireguard(dcp_dir, api_key).await {
         Ok(mesh_ip) => {
             log_startup!("Step 5: WireGuard active — mesh IP {}", mesh_ip);
-            emit_wizard_progress(&window, WizardProgress {
+            emit_wizard_progress(window, WizardProgress {
                 step_id: "tunnel".into(),
                 status: "done".into(),
                 detail: Some(format!("Connected at {}", mesh_ip)),
@@ -4200,7 +4597,7 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
         }
         Err(e) => {
             log_startup!("Step 5: WireGuard setup failed: {}. Provider online but not routable for inference.", e);
-            emit_wizard_progress(&window, WizardProgress {
+            emit_wizard_progress(window, WizardProgress {
                 step_id: "tunnel".into(),
                 status: "done".into(),
                 detail: Some("Connected via public endpoint (WireGuard unavailable)".into()),
@@ -4216,7 +4613,7 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
     // mlx_lm.server downloads on first request and we don't want to block the
     // wizard waiting for an HF download here.
     if engine == "ollama" {
-        emit_wizard_progress(&window, WizardProgress {
+        emit_wizard_progress(window, WizardProgress {
             step_id: "model_verify".into(),
             status: "active".into(),
             detail: Some("Verifying model registered with Ollama".into()),
@@ -4232,7 +4629,7 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
             .await
             .map_err(|e| {
                 let msg = format!("Final verification failed: cannot reach Ollama on :11434 ({})", e);
-                emit_wizard_progress(&window, WizardProgress {
+                emit_wizard_progress(window, WizardProgress {
                     step_id: "model_verify".into(),
                     status: "error".into(),
                     error: Some(msg.clone()),
@@ -4245,7 +4642,7 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
             .await
             .map_err(|e| {
                 let msg = format!("Final verification failed: read body: {}", e);
-                emit_wizard_progress(&window, WizardProgress {
+                emit_wizard_progress(window, WizardProgress {
                     step_id: "model_verify".into(),
                     status: "error".into(),
                     error: Some(msg.clone()),
@@ -4270,7 +4667,7 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
                     "Final verification failed: model={} not found in Ollama after pull",
                     model
                 );
-                emit_wizard_progress(&window, WizardProgress {
+                emit_wizard_progress(window, WizardProgress {
                     step_id: "model_verify".into(),
                     status: "error".into(),
                     error: Some(msg.clone()),
@@ -4279,7 +4676,7 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
                 return Err(msg);
             }
         }
-        emit_wizard_progress(&window, WizardProgress {
+        emit_wizard_progress(window, WizardProgress {
             step_id: "model_verify".into(),
             status: "done".into(),
             detail: Some("Model verified and ready".into()),
@@ -4288,9 +4685,7 @@ async fn full_start_provider(window: tauri::Window, api_key: String, state: Stat
         log_startup!("Verified: model={} reachable via Ollama on :11434", model);
     }
 
-    // Upload all logs to backend (success case)
-    log_startup!("Step 7: All steps complete — uploading logs to backend");
-    upload_provider_logs(&api_key, &dcp_dir).await;
+    log_startup!("Step 7: All steps complete");
 
     Ok(format!("started:{}:{}:{}:{}", engine, model, pid, if model_cached { "cached" } else { "downloaded" }))
 }
@@ -4328,6 +4723,31 @@ async fn upload_provider_logs(api_key: &str, dcp_dir: &std::path::Path) {
         }))
         .send()
         .await;
+}
+
+// ── Report Install Error (callable from frontend on any failure path) ──
+
+#[tauri::command]
+async fn report_install_error(api_key: String, error: String, stage: String) -> Result<(), String> {
+    let dcp_dir = dcp_home()?;
+    // Upload all available logs
+    upload_provider_logs(&api_key, &dcp_dir).await;
+    // POST structured error report to backend
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_default();
+    let _ = client.post(format!("{}/install-error", API_BASE))
+        .json(&serde_json::json!({
+            "error": error,
+            "stage": stage,
+            "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+        }))
+        .header("Authorization", format!("Bearer {}", api_key))
+        .send()
+        .await;
+    Ok(())
 }
 
 // ── Wizard Helper Commands ───────────────────────────────────────────
@@ -4932,6 +5352,7 @@ pub fn run() {
             update_daemon,
             rollback_daemon,
             full_start_provider,
+            report_install_error,
             get_model_metadata,
             pre_install_speed_probe,
             get_network_status,
