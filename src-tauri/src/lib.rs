@@ -2916,6 +2916,22 @@ fn generate_wg_keypair() -> Result<(String, String), String> {
          - Windows: https://www.wireguard.com/install/".to_string())
 }
 
+/// Create Windows firewall rules to allow inbound traffic on the DCP mesh
+/// subnet (10.8.0.0/24) and Ollama port (11434/TCP). Runs silently — errors
+/// are logged but do not fail the WireGuard setup.
+#[cfg(windows)]
+fn create_windows_firewall_rules() {
+    // Allow all inbound from the WireGuard mesh subnet
+    let _ = Command::new("powershell")
+        .args(["-Command", "New-NetFirewallRule -DisplayName 'DCP Mesh Allow' -Direction Inbound -RemoteAddress 10.8.0.0/24 -Action Allow -ErrorAction SilentlyContinue"])
+        .output();
+    // Allow inbound TCP on Ollama port so mesh peers can reach the inference server
+    let _ = Command::new("powershell")
+        .args(["-Command", "New-NetFirewallRule -DisplayName 'DCP Ollama In' -Direction Inbound -LocalPort 11434 -Protocol TCP -Action Allow -ErrorAction SilentlyContinue"])
+        .output();
+    eprintln!("[wg] Windows firewall rules created for DCP mesh (10.8.0.0/24) and Ollama (:11434)");
+}
+
 /// Attempt to activate the WireGuard tunnel using wg-quick or platform tools.
 async fn activate_wireguard(dcp_dir: &std::path::Path) -> Result<(), String> {
     let wg_conf_path = dcp_dir.join("wg0.conf");
@@ -3091,7 +3107,10 @@ done
             .args(["/installtunnelservice", &conf_str])
             .output();
         match install_result {
-            Ok(output) if output.status.success() => return Ok(()),
+            Ok(output) if output.status.success() => {
+                create_windows_firewall_rules();
+                return Ok(());
+            }
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 // Try alternate path
@@ -3101,7 +3120,10 @@ done
                         .args(["/installtunnelservice", &conf_str])
                         .output();
                     match retry {
-                        Ok(o) if o.status.success() => return Ok(()),
+                        Ok(o) if o.status.success() => {
+                            create_windows_firewall_rules();
+                            return Ok(());
+                        }
                         _ => {}
                     }
                 }
@@ -4007,6 +4029,9 @@ async fn full_start_provider_inner(window: &tauri::Window, api_key: &str, state:
                 Command::new(&ollama_cmd())
                     .arg("serve")
                     .env("OLLAMA_HOST", "0.0.0.0")
+                    // Keep models loaded in VRAM permanently — prevents unload
+                    // between requests which would add 10-30s cold-start latency
+                    .env("OLLAMA_KEEP_ALIVE", "-1")
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
             ).spawn()

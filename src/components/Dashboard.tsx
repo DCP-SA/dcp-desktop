@@ -122,7 +122,7 @@ interface RequestEntry {
 
 type DemandLevel = "high" | "moderate" | "low";
 
-// Mock data -- replace with real API calls when backend is ready
+// Default empty states — populated from real API data on mount
 
 const EMPTY_PERFORMANCE: PerformanceData = {
   currentSpeed: 0,
@@ -138,35 +138,10 @@ const EMPTY_ACCOUNT: AccountData = {
   tier: "—",
 };
 
-const MOCK_MODELS = ["Qwen3 8B", "Qwen3 4B", "Gemma4 12B", "Llama 3.1 8B", "Mistral 7B"];
-
 function getTemperatureColor(temp: number): string {
   if (temp < 60) return "#22C55E";
   if (temp < 80) return "#EAB308";
   return "#EF4444";
-}
-
-
-function generateRequestEntry(): RequestEntry {
-  const model = MOCK_MODELS[Math.floor(Math.random() * MOCK_MODELS.length)];
-  const tokens = Math.floor(Math.random() * 400) + 50;
-  const latency = (Math.random() * 3 + 0.5).toFixed(1) + "s";
-  const earned = (tokens * 0.000015).toFixed(4);
-  const now = new Date();
-  const timestamp = now.toLocaleTimeString("en-US", {
-    hour12: false,
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
-  return {
-    id: crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random()}`,
-    timestamp,
-    model,
-    tokens,
-    latency,
-    earned,
-  };
 }
 
 // Sparkline component for temperature history
@@ -298,7 +273,7 @@ export function Dashboard() {
         }
       })
       .catch(() => {
-        // Config not found — stay with mock data
+        // Config not found — stay with default empty state
       });
   }, []);
 
@@ -419,7 +394,7 @@ export function Dashboard() {
       } catch (err) {
         console.error("Dashboard poll failed:", err);
         setIsOnline(false);
-        // Keep existing mock/cached data — no blank screen
+        // Keep existing cached data — no blank screen
       }
     }
 
@@ -528,26 +503,7 @@ export function Dashboard() {
     return () => clearInterval(interval);
   }, [apiKey]);
 
-  // Fallback: mock request feed when offline or no API key
-  useEffect(() => {
-    if (status === "paused") return;
-    // Only generate mock entries if we have no API key (offline mode)
-    if (apiKey) return;
-
-    function scheduleNext() {
-      const delay = Math.random() * 5000 + 3000; // 3-8 seconds
-      return setTimeout(() => {
-        setRequestFeed((prev) => {
-          const entry = generateRequestEntry();
-          const next = [entry, ...prev];
-          return next.slice(0, 20);
-        });
-        timerRef.current = scheduleNext();
-      }, delay);
-    }
-    const timerRef = { current: scheduleNext() };
-    return () => clearTimeout(timerRef.current);
-  }, [status, apiKey]);
+  // Mock request feed removed — only real job data from API is displayed
 
   // ── Feature 4: Network Demand ────────────────────────────────────
   const [demand] = useState<DemandLevel>("moderate");
