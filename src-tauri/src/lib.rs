@@ -140,6 +140,9 @@ pub struct JobEntry {
     pub created_at: String,
     pub completed_at: String,
     pub provider_earned_halala: i64,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub duration_seconds: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -876,6 +879,9 @@ async fn fetch_recent_jobs(api_key: String) -> Result<Vec<JobEntry>, String> {
                 .or_else(|| j["earnings_halala"].as_i64())
                 .or_else(|| j["earned_halala"].as_i64())
                 .unwrap_or(0),
+            prompt_tokens: j["prompt_tokens"].as_i64().unwrap_or(0),
+            completion_tokens: j["completion_tokens"].as_i64().unwrap_or(0),
+            duration_seconds: j["duration_seconds"].as_i64().unwrap_or(0),
         })
         .collect();
 

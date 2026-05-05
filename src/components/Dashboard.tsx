@@ -1032,18 +1032,15 @@ export function Dashboard() {
             </div>
             <div className="impact-box">
               <span className="impact-box-value">
-                <AnimatedCounter target={0} />
+                <AnimatedCounter target={requestFeed.reduce((sum, r) => sum + r.tokens, 0)} />
               </span>
-              <span className="impact-box-label">developers helped</span>
+              <span className="impact-box-label">tokens generated</span>
             </div>
             <div className="impact-box">
-              <span className="impact-box-value">
-                <AnimatedCounter target={0} />
+              <span className="impact-box-value" style={{fontSize: '1.4rem'}}>
+                {(earnings.allTime || 0).toFixed(2)} <span style={{fontSize: '0.8rem', opacity: 0.7}}>SAR</span>
               </span>
-              <span className="impact-box-label">
-                Arabic queries{" "}
-                <span role="img" aria-label="Saudi Arabia flag">&#x1F1F8;&#x1F1E6;</span>
-              </span>
+              <span className="impact-box-label">total earned</span>
             </div>
           </div>
         </section>
