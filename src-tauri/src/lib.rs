@@ -3128,8 +3128,31 @@ done
 #[tauri::command]
 async fn full_start_provider(window: tauri::Window, api_key: String, state: State<'_, DaemonManager>) -> Result<String, String> {
     let dcp_dir = dcp_home()?;
+
+    // Spawn periodic log uploader — uploads every 60s so admin has live visibility
+    // even if the install gets stuck (e.g. on model download).
+    let done_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done_flag_bg = done_flag.clone();
+    let bg_api_key = api_key.clone();
+    let bg_dcp_dir = dcp_dir.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        interval.tick().await; // first tick is immediate, skip it
+        loop {
+            interval.tick().await;
+            if done_flag_bg.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            upload_provider_logs(&bg_api_key, &bg_dcp_dir).await;
+        }
+    });
+
     let result = full_start_provider_inner(&window, &api_key, &state, &dcp_dir).await;
-    // Upload logs on EVERY exit path — success or failure
+
+    // Signal background uploader to stop
+    done_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+
+    // Upload logs on EVERY exit path — success or failure (final upload)
     upload_provider_logs(&api_key, &dcp_dir).await;
     result
 }
@@ -3613,6 +3636,9 @@ async fn full_start_provider_inner(window: &tauri::Window, api_key: &str, state:
 
     log_startup!("Step 2: Engine install complete ({})", engine);
 
+    // Checkpoint: upload logs after engine install so admin sees progress
+    upload_provider_logs(api_key, dcp_dir).await;
+
     // Step 3: Check if model is cached, clean old models, start inference server
     let model_cached: bool;
     if engine == "mlx" {
@@ -3701,6 +3727,8 @@ async fn full_start_provider_inner(window: &tauri::Window, api_key: &str, state:
                 ..Default::default()
             });
             log_startup!("Step 3a: Downloading MLX model {} via huggingface_hub", model);
+            // Checkpoint: upload logs before MLX model download
+            upload_provider_logs(api_key, dcp_dir).await;
 
             let download_script = format!(
                 "import sys; from huggingface_hub import snapshot_download; \
@@ -4019,6 +4047,10 @@ async fn full_start_provider_inner(window: &tauri::Window, api_key: &str, state:
             .unwrap_or(false);
 
         if !model_cached {
+            // Checkpoint: upload logs before model download so admin sees pre-download state
+            log_startup!("Step 3: Starting Ollama model download for {}", model);
+            upload_provider_logs(api_key, dcp_dir).await;
+
             // ── Pre-download speed estimate ──────────────────────────
             let model_size_gb_est: f64 = {
                 let mut sz = 4.0_f64; // fallback guess
@@ -4420,6 +4452,9 @@ async fn full_start_provider_inner(window: &tauri::Window, api_key: &str, state:
 
     log_startup!("Step 3: Model ready — cached={}, engine running on port {}", model_cached, if engine == "mlx" { 8000 } else { 11434 });
 
+    // Checkpoint: upload logs after model step completes
+    upload_provider_logs(api_key, dcp_dir).await;
+
     // Step 4: Download latest daemon with G19 sha256 verification (parity with update_daemon)
     emit_wizard_progress(window, WizardProgress {
         step_id: "daemon".into(),
@@ -4562,6 +4597,9 @@ async fn full_start_provider_inner(window: &tauri::Window, api_key: &str, state:
 
     log_startup!("Step 4: Daemon started — PID={}", pid);
 
+    // Checkpoint: upload logs after daemon start
+    upload_provider_logs(api_key, dcp_dir).await;
+
     emit_wizard_progress(window, WizardProgress {
         step_id: "daemon".into(),
         status: "done".into(),
@@ -4613,6 +4651,9 @@ async fn full_start_provider_inner(window: &tauri::Window, api_key: &str, state:
             // Continue without WG — provider heartbeat works, just no mesh routing
         }
     }
+
+    // Checkpoint: upload logs after WG setup
+    upload_provider_logs(api_key, dcp_dir).await;
 
     // Final verification: confirm the selected model is actually reachable
     // through the inference engine before we declare success. Skip on MLX —
