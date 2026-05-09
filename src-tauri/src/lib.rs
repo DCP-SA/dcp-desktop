@@ -2858,11 +2858,74 @@ async fn setup_wireguard(dcp_dir: &std::path::Path, api_key: &str) -> Result<Str
         }
     }
 
+    // Step 3b: Optionally write wg1.conf fallback (UDP/443) if backend
+    // returned the fallback fields. Most backends won't yet, so this is
+    // best-effort and silently skipped when fields are missing.
+    let wg1_conf_path = dcp_dir.join("wg1.conf");
+    if let (Some(fb_endpoint), Some(fb_pub), Some(fb_target), Some(fb_subnet), Some(ref psk_val)) = (
+        wg_config["fallback_endpoint"].as_str(),
+        wg_config["fallback_server_public_key"].as_str(),
+        wg_config["fallback_tunnel_target"].as_str(),
+        wg_config["fallback_subnet"].as_str(),
+        psk.as_ref(),
+    ) {
+        if !already_registered || !wg1_conf_path.exists() {
+            let conf_content = format!(
+                "[Interface]\n\
+                 PrivateKey = {}\n\
+                 Address = {}/24\n\
+                 DNS = 1.1.1.1\n\
+                 \n\
+                 [Peer]\n\
+                 PublicKey = {}\n\
+                 PresharedKey = {}\n\
+                 Endpoint = {}\n\
+                 AllowedIPs = {}\n\
+                 PersistentKeepalive = 25\n",
+                private_key, fb_target, fb_pub, psk_val, fb_endpoint, fb_subnet
+            );
+            if let Err(e) = std::fs::write(&wg1_conf_path, &conf_content) {
+                eprintln!("[wg] Failed to write wg1.conf (fallback, non-fatal): {}", e);
+            } else {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&wg1_conf_path,
+                        std::fs::Permissions::from_mode(0o600));
+                }
+                eprintln!("[wg] Wrote fallback WG config to {}", wg1_conf_path.display());
+            }
+        }
+    }
+
     // Step 4: Try to activate the WG tunnel
     let activation_result = activate_wireguard(dcp_dir).await;
     match &activation_result {
         Ok(()) => {
             eprintln!("[wg] WireGuard tunnel activated successfully");
+            // Step 4b: Verify tunnel by pinging the server's mesh IP (10.8.0.1).
+            // If primary fails AND wg1.conf exists, fall back to wg1 + 10.9.0.1.
+            if !verify_wg_tunnel("10.8.0.1").await {
+                eprintln!("[wg] Primary tunnel ping failed");
+                if wg1_conf_path.exists() {
+                    eprintln!("[wg] Attempting wg1 fallback...");
+                    match activate_wireguard_fallback(dcp_dir).await {
+                        Ok(()) if verify_wg_tunnel("10.9.0.1").await => {
+                            eprintln!("[wg] Fallback tunnel verified");
+                        }
+                        Ok(()) => {
+                            eprintln!("[wg] Fallback tunnel up but ping failed — leaving up anyway");
+                        }
+                        Err(e) => {
+                            eprintln!("[wg] Fallback activation failed: {}", e);
+                        }
+                    }
+                } else {
+                    eprintln!("[wg] No wg1.conf fallback configured — tunnel may be unreachable");
+                }
+            } else {
+                eprintln!("[wg] Tunnel verified via ping to 10.8.0.1");
+            }
         }
         Err(e) => {
             eprintln!("[wg] WireGuard activation failed: {}. Config saved to {}", e, wg_conf_path.display());
@@ -2872,6 +2935,90 @@ async fn setup_wireguard(dcp_dir: &std::path::Path, api_key: &str) -> Result<Str
     }
 
     Ok(mesh_ip)
+}
+
+/// Ping the WG server's mesh IP from inside the tunnel (5 packets, 1s interval).
+/// Returns true if at least one reply was received. Best-effort — failures
+/// here trigger the wg1 fallback path but do not fail the install.
+async fn verify_wg_tunnel(target: &str) -> bool {
+    // Give the tunnel a beat to come up
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    #[cfg(unix)]
+    let args: Vec<&str> = vec!["-c", "5", "-W", "2", target];
+    #[cfg(windows)]
+    let args: Vec<&str> = vec!["-n", "5", "-w", "2000", target];
+
+    let result = Command::new("ping").args(&args).output();
+    match result {
+        Ok(output) => output.status.success(),
+        Err(_) => false,
+    }
+}
+
+/// Bring up wg1 (UDP/443 fallback) if wg1.conf exists. Linux + macOS only —
+/// Windows doesn't currently use the fallback because the wireguard.exe
+/// service installer does not multiplex two interfaces cleanly.
+#[cfg(unix)]
+async fn activate_wireguard_fallback(dcp_dir: &std::path::Path) -> Result<(), String> {
+    let wg1_conf_path = dcp_dir.join("wg1.conf");
+    if !wg1_conf_path.exists() {
+        return Err("wg1.conf not found".to_string());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let conf_src = wg1_conf_path.to_string_lossy().to_string();
+        let install_and_up = format!(
+            "set -e; install -d -m 0755 /etc/wireguard; \
+             install -m 0600 -o root -g root '{src}' /etc/wireguard/wg1.conf; \
+             {wq} down wg1 2>/dev/null || true; \
+             {wq} up wg1",
+            src = conf_src.replace('\'', "'\\''"),
+            wq = wg_quick_bin(),
+        );
+        let elevator = if command_exists("pkexec") { "pkexec" } else { "sudo" };
+        let r = Command::new(elevator)
+            .args(["sh", "-c", &install_and_up])
+            .output()
+            .map_err(|e| format!("fallback wg-quick spawn failed: {}", e))?;
+        if !r.status.success() {
+            return Err(format!("fallback wg-quick up failed: {}",
+                String::from_utf8_lossy(&r.stderr)));
+        }
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let conf = wg1_conf_path.to_string_lossy().to_string();
+        let wq = wg_quick_bin();
+        let cmd = format!("{wq} down wg1 2>/dev/null; {wq} up {conf}");
+        let r = Command::new("osascript")
+            .args(["-e", &format!(
+                "do shell script \"{}\" with administrator privileges",
+                cmd.replace('"', "\\\"")
+            )])
+            .output()
+            .map_err(|e| format!("osascript fallback failed: {}", e))?;
+        if !r.status.success() {
+            return Err(format!("fallback wg-quick up failed: {}",
+                String::from_utf8_lossy(&r.stderr)));
+        }
+        return Ok(());
+    }
+
+    #[allow(unreachable_code)]
+    Err("Fallback activation not supported on this Unix variant".to_string())
+}
+
+#[cfg(windows)]
+async fn activate_wireguard_fallback(_dcp_dir: &std::path::Path) -> Result<(), String> {
+    // Windows fallback path is parked: the wireguard.exe tunnel service
+    // model doesn't lend itself to a hot wg0→wg1 swap without confusing the
+    // service manager. Real users on Windows almost never hit a UDP-blocked
+    // network in DCP today; revisit if telemetry shows otherwise.
+    Err("wg1 fallback not yet implemented on Windows".to_string())
 }
 
 /// Generate a WireGuard keypair. Tries `wg genkey`/`wg pubkey` first,
@@ -3081,18 +3228,50 @@ done
 
     #[cfg(target_os = "linux")]
     {
-        let up_result = Command::new(wg_quick_bin())
-            .args(["up", &wg_conf_path.to_string_lossy()])
+        // Linux flow:
+        //   1. Copy ~/.dcp/wg0.conf → /etc/wireguard/wg0.conf via pkexec
+        //      (wg-quick requires the conf to live under /etc/wireguard for
+        //      the interface name to be derived from the filename).
+        //   2. wg-quick up wg0 via pkexec.
+        //
+        // pkexec is preferred over sudo because:
+        //   • Tauri apps don't have a controlling tty so sudo prompt would
+        //     hang silently.
+        //   • The bundled polkit policy (sa.dcp.provider.policy) gives the
+        //     user an honest GUI dialog explaining why root is needed.
+        //   • Falls back gracefully if polkit is missing — pkexec itself
+        //     pops a generic prompt.
+        let conf_src = wg_conf_path.to_string_lossy().to_string();
+        let etc_wg_path = "/etc/wireguard/wg0.conf";
+
+        // Use a single sh -c so the user only sees one polkit prompt.
+        let install_and_up = format!(
+            "set -e; install -d -m 0755 /etc/wireguard; \
+             install -m 0600 -o root -g root '{src}' '{dst}'; \
+             {wq} down wg0 2>/dev/null || true; \
+             {wq} up wg0",
+            src = conf_src.replace('\'', "'\\''"),
+            dst = etc_wg_path,
+            wq = wg_quick_bin(),
+        );
+
+        let elevator = if command_exists("pkexec") { "pkexec" } else { "sudo" };
+        let up_result = Command::new(elevator)
+            .args(["sh", "-c", &install_and_up])
             .output();
+
         match up_result {
             Ok(output) if output.status.success() => return Ok(()),
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
+                if stderr.contains("not authorized") || stderr.contains("dismissed") {
+                    return Err("WireGuard setup cancelled — admin authorization required to activate the tunnel.".to_string());
+                }
                 return Err(format!("wg-quick up failed: {}", stderr));
             }
             Err(e) => {
                 if e.kind() == std::io::ErrorKind::NotFound {
-                    return Err("wg-quick not found. Install: sudo apt install wireguard-tools".to_string());
+                    return Err(format!("{} not found. Install: sudo apt install policykit-1 wireguard-tools", elevator));
                 }
                 return Err(format!("wg-quick failed: {}", e));
             }

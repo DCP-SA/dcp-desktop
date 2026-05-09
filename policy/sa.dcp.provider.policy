@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!--
+  DCP Provider polkit policy.
+  Bundled into the .deb at /usr/share/polkit-1/actions/sa.dcp.provider.policy
+
+  These actions are invoked by the Tauri app via `pkexec` during the
+  one-time first-run setup so the user gets an honest "DCP Provider needs
+  admin rights to bring up the WireGuard tunnel" prompt instead of
+  silently failing or asking for sudo on a terminal that isn't there.
+-->
+<policyconfig>
+
+  <vendor>DCP</vendor>
+  <vendor_url>https://dcp.sa</vendor_url>
+
+  <action id="sa.dcp.provider.wg-quick-up">
+    <description>Bring up the DCP WireGuard tunnel</description>
+    <message>DCP Provider needs admin rights to start the WireGuard mesh tunnel that connects your GPU to the network.</message>
+    <defaults>
+      <allow_any>auth_admin_keep</allow_any>
+      <allow_inactive>auth_admin_keep</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/wg-quick</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+
+  <action id="sa.dcp.provider.wg-quick-down">
+    <description>Stop the DCP WireGuard tunnel</description>
+    <message>DCP Provider needs admin rights to stop the WireGuard mesh tunnel.</message>
+    <defaults>
+      <allow_any>auth_admin_keep</allow_any>
+      <allow_inactive>auth_admin_keep</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/wg-quick</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+
+  <action id="sa.dcp.provider.write-wg-conf">
+    <description>Write the DCP WireGuard config to /etc/wireguard</description>
+    <message>DCP Provider needs admin rights to install the WireGuard config file in /etc/wireguard.</message>
+    <defaults>
+      <allow_any>auth_admin_keep</allow_any>
+      <allow_inactive>auth_admin_keep</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/bin/sh</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+
+</policyconfig>
