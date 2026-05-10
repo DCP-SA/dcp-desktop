@@ -2162,3 +2162,27 @@ body {
   padding: 8px 28px;
   font-size: 0.82rem;
 }
+
+/* ── AutoSetup (auto-first-run) ──────────────────────────────────────── */
+.auto-setup-permissions {
+  list-style: none;
+  padding: 0;
+  margin: 16px 0 24px;
+  text-align: left;
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+  line-height: 1.6;
+}
+
+.auto-setup-permissions li {
+  padding: 4px 0 4px 22px;
+  position: relative;
+}
+
+.auto-setup-permissions li::before {
+  content: "•";
+  position: absolute;
+  left: 6px;
+  color: var(--accent, #4f46e5);
+  font-weight: bold;
+}

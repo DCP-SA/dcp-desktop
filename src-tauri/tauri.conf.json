@@ -45,6 +45,25 @@
       "digestAlgorithm": "sha256",
       "timestampUrl": ""
     },
+    "linux": {
+      "deb": {
+        "depends": [
+          "wireguard-tools",
+          "libwebkit2gtk-4.1-0",
+          "libgtk-3-0",
+          "libayatana-appindicator3-1",
+          "librsvg2-2"
+        ],
+        "files": {
+          "/usr/share/polkit-1/actions/sa.dcp.provider.policy": "../policy/sa.dcp.provider.policy",
+          "/usr/lib/systemd/user/dcp-provider.service": "tauri/linux/systemd/dcp-provider.service"
+        },
+        "postInstallScript": "tauri/linux/postinst.sh"
+      },
+      "appimage": {
+        "bundleMediaFramework": false
+      }
+    },
     "createUpdaterArtifacts": true
   },
   "plugins": {
