@@ -55,8 +55,10 @@
           "librsvg2-2"
         ],
         "files": {
-          "/usr/share/polkit-1/actions/sa.dcp.provider.policy": "../policy/sa.dcp.provider.policy"
-        }
+          "/usr/share/polkit-1/actions/sa.dcp.provider.policy": "../policy/sa.dcp.provider.policy",
+          "/usr/lib/systemd/user/dcp-provider.service": "tauri/linux/systemd/dcp-provider.service"
+        },
+        "postInstallScript": "tauri/linux/postinst.sh"
       },
       "appimage": {
         "bundleMediaFramework": false

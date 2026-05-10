@@ -1,0 +1,46 @@
+[Unit]
+# DCP Provider — keeps the GPU-compute daemon alive across user logins
+# and reboots on Linux. Installed by the .deb postinst into
+# /usr/lib/systemd/user/dcp-provider.service and enabled per-user with
+# `systemctl --user enable dcp-provider`.
+#
+# This is the Linux equivalent of macOS launchd's RunAtLoad and Windows
+# Task Scheduler's "At log on" trigger that the existing installer wires
+# up on those platforms. See feat/linux-appimage-and-auto-first-run for
+# the Mac/Windows counterparts.
+Description=DCP Provider GPU compute daemon (user-scope)
+Documentation=https://dcp.sa/docs/provider
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The Tauri installer drops the daemon binary at ~/.dcp/daemon and
+# `daemon-config.json` (with the api_key, run_mode, gpu_usage_cap, etc.)
+# alongside it. This invocation matches what start_daemon_process spawns
+# during the first-run flow so the daemon's behavior is identical whether
+# it was started by the GUI or by systemd at login.
+ExecStart=%h/.dcp/daemon --config %h/.dcp/daemon-config.json
+WorkingDirectory=%h/.dcp
+# Survive transient crashes — the daemon's own circuit breakers will
+# rate-limit retries from inside, so we don't need a backoff here.
+Restart=on-failure
+RestartSec=5
+# Don't try to start until the user has actually completed first-run;
+# the absence of daemon-config.json => systemd will retry every 5s but
+# the user-scope unit only fires on login so this is a non-issue in
+# practice.
+ConditionPathExists=%h/.dcp/daemon-config.json
+# Hand the daemon's stdout/stderr to journald so `journalctl --user -u
+# dcp-provider` Just Works for support.
+StandardOutput=journal
+StandardError=journal
+# Hardening — the daemon doesn't need root or write access outside ~/.dcp.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.dcp
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

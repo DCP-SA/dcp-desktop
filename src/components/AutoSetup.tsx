@@ -6,8 +6,11 @@ import {
   fullStartProvider,
   startDaemon,
   getEstimatedEarnings,
-  validateApiKey,
+  startSigninLoopback,
+  cancelSigninLoopback,
+  sendSigninEmail,
   type GpuInfo,
+  type SigninReceivedPayload,
   type WizardProgress,
 } from "../lib/api";
 
@@ -15,20 +18,22 @@ import {
  * Auto first-run experience.
  *
  * Replaces the previous 5-screen wizard (welcome → hardware → account →
- * config → installing). After the user clicks "Allow All" once, we run
- * everything ourselves and tick a checklist green:
+ * config → installing). After the user clicks "Allow All" once, the only
+ * thing the user ever has to type is their email address, and only then
+ * if no api_key is on disk yet.
  *
- *   1. Detect hardware             — detect_gpu / detect_system
- *   2. Connect account             — paste API key (only screen with input)
- *   3. Install engine              — full_start_provider step
- *   4. Download model              — full_start_provider step
- *   5. Bring up secure tunnel      — full_start_provider step (WG)
- *   6. Start daemon + heartbeat    — full_start_provider step
+ *   1. "Allow All" — user grants the one permission gate
+ *   2. Email + magic-link sign-in — single email input, then we listen on
+ *      a local loopback HTTP server for {api_key, role} delivered by
+ *      dcp.sa/auth/verify after the user clicks the link in their inbox.
+ *   3. Detect hardware             — detect_gpu / detect_system
+ *   4. Install engine              — full_start_provider step
+ *   5. Download model              — full_start_provider step
+ *   6. Bring up secure tunnel      — full_start_provider step (WG)
+ *   7. Start daemon + heartbeat    — full_start_provider step
  *
- * The API-key paste field is unavoidable today: the magic-link sign-in
- * flow lives at https://dcp.sa/setup (web wizard, see Account.tsx note).
- * Once a key is in ~/.dcp/config.json from a previous run we skip the
- * paste and proceed silently.
+ * Returning users (api_key already in ~/.dcp/config.json) skip the email
+ * screen entirely and drop straight into the auto-checklist.
  */
 
 type StepStatus = "pending" | "active" | "done" | "error";
@@ -68,18 +73,24 @@ const STEP_MAP: Record<string, string> = {
   daemon: "daemon",
 };
 
+// Sign-in screen states
+type SigninPhase = "form" | "sending" | "waiting" | "received" | "timeout" | "error";
+
 export function AutoSetup({ onComplete, initialApiKey }: AutoSetupProps) {
   const [steps, setSteps] = useState<SetupStep[]>(STEP_TEMPLATE);
   const [permissionsGranted, setPermissionsGranted] = useState(false);
   const [needApiKey, setNeedApiKey] = useState(!initialApiKey);
-  const [pendingKey, setPendingKey] = useState("");
-  const [keyError, setKeyError] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [errorStep, setErrorStep] = useState<string | null>(null);
   const [retryCounter, setRetryCounter] = useState(0);
   const [earnings, setEarnings] = useState<number | null>(null);
   const [gpu, setGpu] = useState<GpuInfo | null>(null);
   const [complete, setComplete] = useState(false);
+
+  // Sign-in form state
+  const [email, setEmail] = useState("");
+  const [signinPhase, setSigninPhase] = useState<SigninPhase>("form");
+  const [signinError, setSigninError] = useState("");
 
   // Stable ref for API key once provided
   const apiKeyRef = useRef<string>(initialApiKey ?? "");
@@ -105,25 +116,68 @@ export function AutoSetup({ onComplete, initialApiKey }: AutoSetupProps) {
     setPermissionsGranted(true);
   }
 
-  // ── API key submit ──────────────────────────────────────────────────
-  async function handleKeySubmit() {
-    setKeyError("");
-    const key = pendingKey.trim();
-    if (!key.startsWith("dcp-provider-") || key.length < 20) {
-      setKeyError(
-        'API key must start with "dcp-provider-" and be at least 20 characters.'
-      );
+  // ── Embedded magic-link sign-in ─────────────────────────────────────
+  //
+  // Subscribes to `signin:received`, `signin:timeout`, `signin:cancelled`
+  // events from Rust. Mounts when the user is on the email screen and
+  // tears down on unmount or after we get an api_key.
+  useEffect(() => {
+    if (!permissionsGranted) return;
+    if (!needApiKey) return;
+
+    let unlistenReceived: UnlistenFn | undefined;
+    let unlistenTimeout: UnlistenFn | undefined;
+
+    listen<SigninReceivedPayload>("signin:received", (event) => {
+      const p = event.payload;
+      if (!p || !p.api_key) return;
+      apiKeyRef.current = p.api_key;
+      setSigninPhase("received");
+      // Tiny delay so the "Got it" tick is visible before transitioning.
+      setTimeout(() => {
+        setNeedApiKey(false);
+      }, 600);
+    }).then((fn) => {
+      unlistenReceived = fn;
+    });
+
+    listen("signin:timeout", () => {
+      setSigninPhase("timeout");
+    }).then((fn) => {
+      unlistenTimeout = fn;
+    });
+
+    return () => {
+      unlistenReceived?.();
+      unlistenTimeout?.();
+      // Best-effort: if user navigates away, kill the listener.
+      cancelSigninLoopback().catch(() => { /* ignore */ });
+    };
+  }, [permissionsGranted, needApiKey]);
+
+  async function handleEmailSubmit() {
+    setSigninError("");
+    const e = email.trim();
+    if (!e || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)) {
+      setSigninError("Please enter a valid email address.");
       return;
     }
-    // Best-effort backend validation; non-blocking on failure
+    setSigninPhase("sending");
     try {
-      const t = new Promise((_, rej) => setTimeout(() => rej(new Error("t")), 3000));
-      await Promise.race([validateApiKey(key), t]);
-    } catch {
-      // OK — client-side already passed
+      const cb = await startSigninLoopback();
+      await sendSigninEmail(e, "provider", cb.callback_url);
+      setSigninPhase("waiting");
+    } catch (err) {
+      setSigninError(String(err));
+      setSigninPhase("error");
+      // Tear down any half-started listener so a retry gets a clean port.
+      cancelSigninLoopback().catch(() => { /* ignore */ });
     }
-    apiKeyRef.current = key;
-    setNeedApiKey(false);
+  }
+
+  function handleResendEmail() {
+    setSigninPhase("form");
+    setSigninError("");
   }
 
   // ── Main install loop ───────────────────────────────────────────────
@@ -185,7 +239,7 @@ export function AutoSetup({ onComplete, initialApiKey }: AutoSetupProps) {
       // Step 2: account (already validated above before we got here)
       setStep("account", {
         status: "done",
-        detail: "API key accepted",
+        detail: "Signed in",
       });
 
       // Step 3-6: chained start. Rust emits wizard:progress events for the
@@ -289,41 +343,122 @@ export function AutoSetup({ onComplete, initialApiKey }: AutoSetupProps) {
   }
 
   if (needApiKey) {
+    if (signinPhase === "waiting") {
+      return (
+        <div className="step-container">
+          <h2 className="step-title">📧 Check your email</h2>
+          <p className="step-subtitle">
+            We sent a sign-in link to <strong>{email}</strong>. Click the
+            button in the email — this window will continue automatically
+            when you do.
+          </p>
+          <div className="install-steps mt-16">
+            <div className="install-step active">
+              <div className="install-step-icon">
+                <span className="spinner" />
+              </div>
+              <span className="install-step-label">
+                Waiting for you to click the link…
+              </span>
+            </div>
+          </div>
+          <p className="text-sm text-muted mt-16 text-center">
+            The link expires in 15 minutes. Check your spam folder if you
+            don't see it within a minute.
+          </p>
+          <div className="step-actions mt-16">
+            <button
+              className="btn btn-secondary"
+              onClick={() => {
+                cancelSigninLoopback().catch(() => { /* ignore */ });
+                setSigninPhase("form");
+              }}
+            >
+              Use a different email
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    if (signinPhase === "received") {
+      return (
+        <div className="step-container">
+          <div className="completion-card">
+            <div className="completion-icon">&#10003;</div>
+            <div className="completion-title">Signed in</div>
+            <div className="completion-subtitle">
+              Continuing setup…
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    if (signinPhase === "timeout") {
+      return (
+        <div className="step-container">
+          <h2 className="step-title">Link expired</h2>
+          <p className="step-subtitle">
+            The sign-in link wasn't used within 5 minutes. Send a new one?
+          </p>
+          <div className="step-actions mt-16">
+            <button className="btn btn-primary" onClick={handleResendEmail}>
+              Send a new link
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    // signinPhase === "form" | "sending" | "error"
+    const sending = signinPhase === "sending";
     return (
       <div className="step-container">
-        <h2 className="step-title">Connect your account</h2>
+        <h2 className="step-title">Sign in to DCP</h2>
         <p className="step-subtitle">
-          Paste your DCP provider API key. Don't have one yet?{" "}
-          <a href="https://dcp.sa/setup" target="_blank" rel="noreferrer">
-            Sign in at dcp.sa/setup
-          </a>{" "}
-          (magic-link, no password) and we'll email you a key.
+          Enter your email to sign in or create your DCP account. We'll send
+          you a one-click sign-in link — no password needed.
         </p>
         <input
-          type="text"
+          type="email"
+          inputMode="email"
+          autoComplete="email"
           className="input-field"
-          placeholder="dcp-provider-..."
-          value={pendingKey}
+          placeholder="you@example.com"
+          value={email}
           onChange={(e) => {
-            setPendingKey(e.target.value);
-            setKeyError("");
+            setEmail(e.target.value);
+            setSigninError("");
           }}
           onKeyDown={(e) => {
-            if (e.key === "Enter") handleKeySubmit();
+            if (e.key === "Enter" && !sending) handleEmailSubmit();
           }}
           autoFocus
-          aria-label="API key"
+          aria-label="Email address"
+          disabled={sending}
         />
-        {keyError && <div className="input-error mt-8">{keyError}</div>}
+        {signinError && <div className="input-error mt-8">{signinError}</div>}
         <div className="step-actions">
           <button
             className="btn btn-primary"
-            onClick={handleKeySubmit}
-            disabled={pendingKey.length < 10}
+            onClick={handleEmailSubmit}
+            disabled={sending || email.length < 3}
           >
-            Continue
+            {sending ? "Sending…" : "Send sign-in link"}
           </button>
         </div>
+        <p className="text-sm text-muted mt-16 text-center">
+          By continuing you agree to the DCP{" "}
+          <a href="https://dcp.sa/terms" target="_blank" rel="noreferrer">
+            Terms
+          </a>
+          {" "}and{" "}
+          <a href="https://dcp.sa/privacy" target="_blank" rel="noreferrer">
+            Privacy Policy
+          </a>
+          .
+        </p>
       </div>
     );
   }

@@ -282,6 +282,47 @@ export async function getModelMetadata(modelId: string): Promise<ModelMetadata> 
   return invoke<ModelMetadata>("get_model_metadata", { modelId });
 }
 
+// ── Embedded magic-link sign-in ──────────────────────────────────────
+//
+// First-run flow when no api_key is on disk:
+//   1. startSigninLoopback() — Rust binds a one-shot HTTP listener on
+//      127.0.0.1:<random> and returns the absolute callback URL.
+//   2. sendSigninEmail({email, role, callbackUrl}) — backend sends magic
+//      link to the user with `?desktop_callback=<callbackUrl>` appended.
+//   3. User clicks link in email → dcp.sa/auth/verify exchanges token,
+//      POSTs {api_key, role, …} to the loopback URL.
+//   4. Tauri emits a `signin:received` event with SigninReceivedPayload.
+//      Subscribe with `listen('signin:received', cb)`.
+//   5. cancelSigninLoopback() — call when user navigates away.
+
+export interface SigninLoopback {
+  port: number;
+  callback_url: string;
+}
+
+export interface SigninReceivedPayload {
+  api_key: string;
+  role: "provider" | "renter";
+  provider?: { name?: string; email?: string };
+  renter?: { name?: string; email?: string };
+}
+
+export async function startSigninLoopback(): Promise<SigninLoopback> {
+  return invoke<SigninLoopback>("start_signin_loopback");
+}
+
+export async function cancelSigninLoopback(): Promise<void> {
+  return invoke<void>("cancel_signin_loopback");
+}
+
+export async function sendSigninEmail(
+  email: string,
+  role: "provider" | "renter",
+  callbackUrl: string
+): Promise<void> {
+  return invoke<void>("send_signin_email", { email, role, callbackUrl });
+}
+
 // ── Network Status & Key Rotation ────────────────────────────────────
 
 export interface NetworkStatus {
