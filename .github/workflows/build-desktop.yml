@@ -202,6 +202,14 @@ jobs:
             src-tauri/target/release/bundle/appimage/*.sig
           if-no-files-found: ignore
 
+      - name: Rename Linux artifacts to stable filenames
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          # Stable, predictable filenames so api.dcp.sa/download/linux can
+          # 302-redirect to a fixed URL across releases.
+          cp src-tauri/target/release/bundle/appimage/*.AppImage dcp-provider-linux.AppImage
+          cp src-tauri/target/release/bundle/deb/*.deb           dcp-provider-linux.deb
+
       - name: Attach artifacts to GitHub Release (tags only)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
@@ -211,4 +219,6 @@ jobs:
             src-tauri/target/release/bundle/appimage/*.AppImage.tar.gz
             src-tauri/target/release/bundle/appimage/*.sig
             src-tauri/target/release/bundle/deb/*.deb
+            dcp-provider-linux.AppImage
+            dcp-provider-linux.deb
           fail_on_unmatched_files: false
