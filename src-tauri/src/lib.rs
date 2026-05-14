@@ -655,10 +655,13 @@ async fn validate_api_key(key: String) -> Result<bool, String> {
         return Ok(false);
     }
 
-    // Verify against backend — fall back to format-only if offline
+    // Verify against backend — fall back to format-only if offline.
+    // Audit 2026-05-14 F3 — send key in header only, not as ?key= URL param.
+    // URL-borne credentials leak into proxy/CDN logs and referrer headers.
     let client = reqwest::Client::new();
     let resp = client
-        .get(format!("https://api.dcp.sa/api/providers/me?key={}", key))
+        .get("https://api.dcp.sa/api/providers/me")
+        .header("x-api-key", &key)
         .timeout(std::time::Duration::from_secs(5))
         .send()
         .await;
@@ -704,6 +707,18 @@ async fn start_daemon(api_key: String, config: DaemonConfig) -> Result<String, S
 
     std::fs::write(&config_path, serde_json::to_string_pretty(&config_json).unwrap())
         .map_err(|e| format!("Failed to write config: {}", e))?;
+
+    // Audit 2026-05-14 F4 — config.json contains the api_key. Default umask
+    // leaves it world-readable (0644) on multi-user macOS/Linux boxes. Lock it
+    // down to owner-only (0600). Windows: rely on per-user profile ACLs.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(
+            &config_path,
+            std::fs::Permissions::from_mode(0o600),
+        );
+    }
 
     Ok(format!(
         "Configuration saved to {}. Daemon ready to start.",
@@ -5267,6 +5282,16 @@ async fn rotate_network_key() -> Result<String, String> {
         if let Ok(mut cfg) = serde_json::from_str::<serde_json::Value>(&content) {
             cfg["wg_mesh_ip"] = serde_json::Value::String(assigned_ip.to_string());
             let _ = std::fs::write(&config_path, serde_json::to_string_pretty(&cfg).unwrap_or_default());
+            // Audit 2026-05-14 F4 — re-apply 0600 since std::fs::write may
+            // recreate the file with default umask.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    &config_path,
+                    std::fs::Permissions::from_mode(0o600),
+                );
+            }
         }
     }
 
