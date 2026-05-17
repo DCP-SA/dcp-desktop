@@ -7,6 +7,8 @@ use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri_plugin_notification::NotificationExt;
 use reqwest;
 use serde_json::Value;
+use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 // ── Data Structures ──────────────────────────────────────────────────
 
@@ -951,6 +953,929 @@ async fn read_config() -> Result<SavedConfig, String> {
         start_on_boot: json["start_on_boot"].as_bool().unwrap_or(true),
         served_model: json["served_model"].as_str().unwrap_or("").to_string(),
     })
+}
+
+// ── Window resize for collapsed/expanded agent bar ───────────────────
+
+#[tauri::command]
+fn resize_window(app: AppHandle, width: u32, height: u32) -> Result<(), String> {
+    if let Some(win) = app.get_webview_window("main") {
+        win.set_size(tauri::Size::Logical(tauri::LogicalSize { width: width as f64, height: height as f64 }))
+            .map_err(|e| format!("resize failed: {}", e))?;
+        if height > 100 {
+            let _ = win.set_resizable(true);
+        } else {
+            let _ = win.set_resizable(false);
+        }
+    }
+    Ok(())
+}
+
+// ── Fetch real provider data from backend API ────────────────────────
+
+#[tauri::command]
+async fn fetch_provider_earnings() -> Result<String, String> {
+    // Read provider key from config
+    let api_key = load_api_key_from_config().unwrap_or_default();
+    if api_key.is_empty() {
+        return Err("No provider key configured".into());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("{}", e))?;
+    let res = client
+        .get("https://api.dcp.sa/api/providers/me")
+        .header("x-provider-key", &api_key)
+        .send()
+        .await
+        .map_err(|e| format!("Fetch failed: {}", e))?;
+    res.text().await.map_err(|e| format!("Read failed: {}", e))
+}
+
+// ── Agent chat — routes through local Hermes gateway WebSocket ──────
+
+/// Cached Hermes WS session ID (survives across calls)
+static HERMES_SESSION_ID: std::sync::LazyLock<tokio::sync::Mutex<Option<String>>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(None));
+
+#[tauri::command]
+async fn agent_chat(messages_json: String) -> Result<String, String> {
+    // Extract user message
+    let parsed: serde_json::Value = serde_json::from_str(&messages_json)
+        .map_err(|e| format!("JSON parse: {}", e))?;
+    let user_msg = parsed["messages"]
+        .as_array()
+        .and_then(|msgs| msgs.iter().rev().find(|m| m["role"] == "user"))
+        .and_then(|m| m["content"].as_str())
+        .unwrap_or("")
+        .to_string();
+
+    // Try Hermes WebSocket gateway first (fast, persistent connection)
+    match hermes_ws_chat(&user_msg).await {
+        Ok(r) => Ok(r),
+        Err(ws_err) => {
+            eprintln!("[agent_chat] Hermes WS failed: {}. Falling back to MiniMax API.", ws_err);
+            // Fallback to direct MiniMax via api.dcp.sa if Hermes gateway is down
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .map_err(|e| format!("Client error: {}", e))?;
+            let res = client
+                .post("https://api.dcp.sa/api/agent/gateway/chat/completions")
+                .header("Content-Type", "application/json")
+                .body(messages_json)
+                .send()
+                .await
+                .map_err(|e| format!("Request failed: {}", e))?;
+            let body = res.text().await.map_err(|e| format!("Read failed: {}", e))?;
+            Ok(body)
+        }
+    }
+}
+
+/// Connect to the local Hermes gateway via WebSocket, send a prompt, collect the streamed response.
+/// Each call opens a fresh WS connection (lightweight) but reuses the session_id across calls.
+async fn hermes_ws_chat(prompt: &str) -> Result<String, String> {
+    // 1. Read token from ~/.dcp/hermes-session-token
+    let token_path = dirs::home_dir()
+        .ok_or("No home directory")?
+        .join(".dcp")
+        .join("hermes-session-token");
+    let token = tokio::fs::read_to_string(&token_path)
+        .await
+        .map_err(|e| format!("Cannot read token at {}: {}", token_path.display(), e))?
+        .trim()
+        .to_string();
+
+    if token.is_empty() {
+        return Err("Hermes session token is empty".into());
+    }
+
+    // 2. Connect to Hermes gateway WebSocket
+    let ws_url = format!("ws://localhost:18789/api/ws?token={}", token);
+
+    let (mut ws_stream, _response) = tokio_tungstenite::connect_async(&ws_url)
+        .await
+        .map_err(|e| format!("WS connect failed (is Hermes gateway running?): {}", e))?;
+
+    // 3. Wait for gateway.ready event (with timeout)
+    let ready_timeout = std::time::Duration::from_secs(10);
+    let ready_result = tokio::time::timeout(ready_timeout, async {
+        while let Some(msg) = ws_stream.next().await {
+            let msg = msg.map_err(|e| format!("WS read error: {}", e))?;
+            if let WsMessage::Text(text) = msg {
+                let val: serde_json::Value = serde_json::from_str(&text)
+                    .unwrap_or(serde_json::Value::Null);
+                if val["method"] == "gateway.ready" {
+                    return Ok::<(), String>(());
+                }
+            }
+        }
+        Err("WS closed before gateway.ready".into())
+    })
+    .await;
+
+    match ready_result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Err("Timeout waiting for gateway.ready".into()),
+    }
+
+    // 4. Create or reuse a session
+    let session_id = {
+        let cached = HERMES_SESSION_ID.lock().await;
+        cached.clone()
+    };
+
+    let session_id = if let Some(sid) = session_id {
+        sid
+    } else {
+        // Send session.create
+        let create_req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "create-1",
+            "method": "session.create",
+            "params": {}
+        });
+        ws_stream
+            .send(WsMessage::Text(create_req.to_string().into()))
+            .await
+            .map_err(|e| format!("WS send session.create: {}", e))?;
+
+        // Wait for the response with session_id
+        let create_timeout = std::time::Duration::from_secs(10);
+        let sid = tokio::time::timeout(create_timeout, async {
+            while let Some(msg) = ws_stream.next().await {
+                let msg = msg.map_err(|e| format!("WS read error: {}", e))?;
+                if let WsMessage::Text(text) = msg {
+                    let val: serde_json::Value = serde_json::from_str(&text)
+                        .unwrap_or(serde_json::Value::Null);
+                    // JSON-RPC response to our create-1 request
+                    if val["id"] == "create-1" {
+                        if let Some(sid) = val["result"]["session_id"].as_str() {
+                            return Ok::<String, String>(sid.to_string());
+                        }
+                        if let Some(err) = val["error"]["message"].as_str() {
+                            return Err(format!("session.create error: {}", err));
+                        }
+                    }
+                }
+            }
+            Err("WS closed before session.create response".into())
+        })
+        .await
+        .map_err(|_| "Timeout waiting for session.create response".to_string())??;
+
+        // Cache the session_id
+        {
+            let mut cached = HERMES_SESSION_ID.lock().await;
+            *cached = Some(sid.clone());
+        }
+        sid
+    };
+
+    // 5. Send prompt.submit
+    let prompt_req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "prompt-1",
+        "method": "prompt.submit",
+        "params": {
+            "session_id": session_id,
+            "text": prompt
+        }
+    });
+    ws_stream
+        .send(WsMessage::Text(prompt_req.to_string().into()))
+        .await
+        .map_err(|e| format!("WS send prompt.submit: {}", e))?;
+
+    // 6. Collect streaming response: message.delta events until message.done
+    let stream_timeout = std::time::Duration::from_secs(120);
+    let response_text = tokio::time::timeout(stream_timeout, async {
+        let mut full_response = String::new();
+        let mut _got_streaming_ack = false;
+
+        while let Some(msg) = ws_stream.next().await {
+            let msg = msg.map_err(|e| format!("WS read error: {}", e))?;
+            match msg {
+                WsMessage::Text(text) => {
+                    let val: serde_json::Value = serde_json::from_str(&text)
+                        .unwrap_or(serde_json::Value::Null);
+
+                    // JSON-RPC response to prompt-1 (should be {"status":"streaming"})
+                    if val["id"] == "prompt-1" {
+                        if val["error"].is_object() {
+                            let err_msg = val["error"]["message"]
+                                .as_str()
+                                .unwrap_or("unknown error");
+                            return Err(format!("prompt.submit error: {}", err_msg));
+                        }
+                        _got_streaming_ack = true;
+                        continue;
+                    }
+
+                    // Streaming events (notifications — no "id" field)
+                    let method = val["method"].as_str().unwrap_or("");
+                    match method {
+                        "message.start" => {
+                            // Session is producing a response
+                        }
+                        "message.delta" => {
+                            if let Some(content) = val["params"]["content"].as_str() {
+                                full_response.push_str(content);
+                            }
+                        }
+                        "message.done" => {
+                            break;
+                        }
+                        _ => {
+                            // Ignore unknown events
+                        }
+                    }
+                }
+                WsMessage::Close(_) => break,
+                _ => {}
+            }
+        }
+
+        Ok::<String, String>(full_response)
+    })
+    .await
+    .map_err(|_| "Timeout waiting for Hermes response (120s)".to_string())??;
+
+    // 7. Close the WebSocket cleanly
+    let _ = ws_stream.close(None).await;
+
+    // 8. Wrap in OpenAI-compatible format for the frontend
+    let wrapped = serde_json::json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": if response_text.is_empty() {
+                    "Hermes processed the request but returned no content.".to_string()
+                } else {
+                    response_text
+                }
+            }
+        }]
+    });
+
+    Ok(wrapped.to_string())
+}
+
+// ── Agent actions — actually fix things ──────────────────────────────
+
+#[tauri::command]
+async fn agent_fix_wireguard() -> Result<String, String> {
+    let mut log = String::new();
+
+    // Step 1: Check if tunnel is actually down
+    let ping = tokio::process::Command::new("ping")
+        .args(["-c", "1", "-W", "2", "10.8.0.1"])
+        .output().await;
+    if ping.map(|o| o.status.success()).unwrap_or(false) {
+        return Ok("Tunnel is actually up. Pinged 10.8.0.1 successfully.".into());
+    }
+    log.push_str("Tunnel confirmed down. ");
+
+    // Step 2: Try wg-quick via homebrew bash (macOS bash v3 doesn't work)
+    let brew_bash = std::path::PathBuf::from("/opt/homebrew/bin/bash");
+    let wg_conf = dirs::home_dir().unwrap_or_default().join(".dcp").join("wg0.conf");
+
+    // Find wg-quick path
+    let wg_quick_path = if std::path::Path::new("/opt/homebrew/bin/wg-quick").exists() {
+        "/opt/homebrew/bin/wg-quick"
+    } else if std::path::Path::new("/usr/local/bin/wg-quick").exists() {
+        "/usr/local/bin/wg-quick"
+    } else {
+        "wg-quick"
+    };
+
+    if wg_conf.exists() {
+        // Use a shell command that works on both macOS and Linux
+        let down_cmd = if brew_bash.exists() {
+            format!("sudo {} {} down wg0 2>/dev/null; sleep 1; sudo {} {} up {}",
+                brew_bash.display(), wg_quick_path, brew_bash.display(), wg_quick_path, wg_conf.display())
+        } else {
+            format!("sudo wg-quick down wg0 2>/dev/null; sleep 1; sudo wg-quick up {}", wg_conf.display())
+        };
+        let up_result = tokio::process::Command::new("sh")
+            .args(["-c", &down_cmd])
+            .output().await;
+        match &up_result {
+            Ok(o) if o.status.success() => log.push_str("Ran wg-quick down/up. "),
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                log.push_str(&format!("wg-quick: {}. ", stderr.trim()));
+            },
+            Err(e) => log.push_str(&format!("wg-quick failed: {}. ", e)),
+        }
+
+        // Wait and check
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let ping2 = tokio::process::Command::new("ping")
+            .args(["-c", "1", "-W", "3", "10.8.0.1"])
+            .output().await;
+        if ping2.map(|o| o.status.success()).unwrap_or(false) {
+            log.push_str("FIXED. Tunnel reconnected.");
+            return Ok(log);
+        }
+    }
+
+    // Step 3: Try direct wg command (also use homebrew bash to avoid bash v3 error)
+    let fallback_cmd = if brew_bash.exists() {
+        format!("sudo {} {} down wg0 2>/dev/null; sleep 1; sudo {} {} up {}",
+            brew_bash.display(), wg_quick_path, brew_bash.display(), wg_quick_path, wg_conf.display())
+    } else {
+        format!("sudo {} down wg0 2>/dev/null; sleep 1; sudo {} up {}",
+            wg_quick_path, wg_quick_path, wg_conf.display())
+    };
+    let up = tokio::process::Command::new("sh")
+        .args(["-c", &fallback_cmd])
+        .output().await;
+    match up {
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            if !o.status.success() {
+                log.push_str(&format!("wg-quick failed: {}. ", stderr.trim()));
+            }
+        }
+        Err(e) => log.push_str(&format!("wg-quick error: {}. ", e)),
+    }
+
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let ping3 = tokio::process::Command::new("ping")
+        .args(["-c", "1", "-W", "3", "10.8.0.1"])
+        .output().await;
+    if ping3.map(|o| o.status.success()).unwrap_or(false) {
+        log.push_str("FIXED on second attempt.");
+    } else {
+        log.push_str("Still down after 2 attempts. May need manual intervention — check wg0.conf and VPS firewall.");
+    }
+    Ok(log)
+}
+
+#[tauri::command]
+async fn agent_fix_ollama() -> Result<String, String> {
+    let mut log = String::new();
+
+    // Check if already running
+    let check = tokio::process::Command::new("curl")
+        .args(["-sf", "http://localhost:11434/"])
+        .output().await;
+    if check.map(|o| o.status.success()).unwrap_or(false) {
+        return Ok("Ollama is already running.".into());
+    }
+    log.push_str("Ollama confirmed down. ");
+
+    // Kill any zombie
+    let _ = tokio::process::Command::new("pkill")
+        .args(["-f", "ollama serve"])
+        .output().await;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // Restart
+    let _ = tokio::process::Command::new("sh")
+        .args(["-c", "OLLAMA_HOST=0.0.0.0 OLLAMA_KEEP_ALIVE=-1 nohup ollama serve > ~/.dcp/logs/ollama.log 2>&1 &"])
+        .output().await;
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+    let check2 = tokio::process::Command::new("curl")
+        .args(["-sf", "http://localhost:11434/"])
+        .output().await;
+    if check2.map(|o| o.status.success()).unwrap_or(false) {
+        log.push_str("FIXED. Ollama restarted and responding.");
+    } else {
+        log.push_str("Still down. May need manual check.");
+    }
+    Ok(log)
+}
+
+// ── Real system checks — agent actually looks at the machine ─────────
+
+/// Read the WireGuard gateway IP from ~/.dcp/wg0.conf (Endpoint) or ~/.dcp/config.json (wg_gateway).
+/// Falls back to 10.8.0.1 if neither source is available.
+fn read_wg_gateway() -> String {
+    let home = dirs::home_dir().unwrap_or_default();
+    let dcp_dir = home.join(".dcp");
+
+    // Try wg0.conf first — look for Endpoint = <ip>:<port>
+    if let Ok(conf) = std::fs::read_to_string(dcp_dir.join("wg0.conf")) {
+        for line in conf.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("Endpoint") {
+                // Endpoint = 1.2.3.4:51820
+                if let Some(val) = trimmed.split('=').nth(1) {
+                    let val = val.trim();
+                    // Strip port
+                    if let Some(ip) = val.split(':').next() {
+                        let ip = ip.trim();
+                        if !ip.is_empty() {
+                            return ip.to_string();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Try config.json — look for wg_gateway or wg_mesh_ip
+    if let Ok(cfg_str) = std::fs::read_to_string(dcp_dir.join("config.json")) {
+        if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&cfg_str) {
+            if let Some(gw) = cfg.get("wg_gateway").and_then(|v| v.as_str()) {
+                if !gw.is_empty() { return gw.to_string(); }
+            }
+            // wg_server_ip as another fallback key name
+            if let Some(gw) = cfg.get("wg_server_ip").and_then(|v| v.as_str()) {
+                if !gw.is_empty() { return gw.to_string(); }
+            }
+        }
+    }
+
+    "10.8.0.1".to_string()
+}
+
+#[tauri::command]
+async fn check_wireguard() -> Result<String, String> {
+    let gateway = read_wg_gateway();
+
+    let ping = tokio::process::Command::new("ping")
+        .args(["-c", "1", "-W", "2", &gateway])
+        .output().await;
+    let up = ping.map(|o| o.status.success()).unwrap_or(false);
+
+    let wg_out = tokio::process::Command::new("sudo")
+        .args(["wg", "show"])
+        .output().await;
+    let wg_info = wg_out.map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
+    let has_handshake = wg_info.contains("latest handshake");
+
+    let ip = tokio::process::Command::new("sh")
+        .args(["-c", "ifconfig | grep -A2 utun | grep 'inet ' | awk '{print $2}'"])
+        .output().await
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+
+    if up {
+        Ok(format!("WireGuard is UP. Mesh IP: {}. Gateway {} reachable. Handshake: {}.",
+            if ip.is_empty() { "unknown" } else { &ip },
+            gateway,
+            if has_handshake { "recent" } else { "none" }))
+    } else {
+        Ok(format!("WireGuard is DOWN. Interface exists ({}), handshake: {}, but can't reach gateway {}. Run 'fix it' and I'll reconnect.",
+            if ip.is_empty() { "no IP" } else { &ip },
+            if has_handshake { "yes but stale" } else { "none" },
+            gateway))
+    }
+}
+
+#[tauri::command]
+async fn check_ollama() -> Result<String, String> {
+    let health = tokio::process::Command::new("curl")
+        .args(["-sf", "http://localhost:11434/"])
+        .output().await;
+    let up = health.map(|o| o.status.success()).unwrap_or(false);
+
+    if !up {
+        return Ok("Ollama is DOWN. Not responding on localhost:11434. Say 'fix ollama' and I'll restart it.".into());
+    }
+
+    let tags = tokio::process::Command::new("curl")
+        .args(["-sf", "http://localhost:11434/api/tags"])
+        .output().await;
+    let models_str = tags.map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
+
+    let ps = tokio::process::Command::new("curl")
+        .args(["-sf", "http://localhost:11434/api/ps"])
+        .output().await;
+    let ps_str = ps.map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
+
+    Ok(format!("Ollama is UP and responding. Models installed: {}. Running processes: {}.",
+        if models_str.contains("name") { &models_str[..100.min(models_str.len())] } else { "checking..." },
+        if ps_str.contains("model") { "active inference" } else { "idle, ready for jobs" }))
+}
+
+#[tauri::command]
+async fn check_disk() -> Result<String, String> {
+    let df = tokio::process::Command::new("df")
+        .args(["-h", "/"])
+        .output().await;
+    let df_str = df.map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
+    let lines: Vec<&str> = df_str.lines().collect();
+    if lines.len() >= 2 {
+        let parts: Vec<&str> = lines[1].split_whitespace().collect();
+        if parts.len() >= 5 {
+            let pct = parts[4].trim_end_matches('%').parse::<u32>().unwrap_or(0);
+            let free = parts[3];
+            let msg = if pct > 90 {
+                format!("Disk is CRITICAL — {}% used, only {} free. I should clean old logs and Ollama cache.", pct, free)
+            } else if pct > 75 {
+                format!("Disk at {}% used, {} free. Getting full. Will clean up old logs tonight.", pct, free)
+            } else {
+                format!("Disk is fine. {}% used, {} free. Plenty of room.", pct, free)
+            };
+            return Ok(msg);
+        }
+    }
+    Ok("Couldn't read disk info.".into())
+}
+
+// ── Comprehensive system check — single JSON blob ───────────────────
+
+#[tauri::command]
+async fn check_system() -> Result<String, String> {
+    // All sub-checks run concurrently
+    let gpu_fut = check_system_gpu();
+    let ram_fut = check_system_ram();
+    let disk_fut = check_system_disk();
+    let ollama_fut = check_system_ollama();
+    let wg_fut = check_system_wg();
+    let uptime_fut = check_system_uptime();
+    let ip_fut = check_system_public_ip();
+
+    let (gpu, ram, disk, ollama, wg, sys_uptime, public_ip) =
+        tokio::join!(gpu_fut, ram_fut, disk_fut, ollama_fut, wg_fut, uptime_fut, ip_fut);
+
+    let result = serde_json::json!({
+        "gpu": gpu.unwrap_or_default(),
+        "ram": ram.unwrap_or_default(),
+        "disk": disk.unwrap_or_default(),
+        "ollama": ollama.unwrap_or_default(),
+        "wireguard": wg.unwrap_or_default(),
+        "uptime": sys_uptime.unwrap_or_else(|_| "unknown".to_string()),
+        "public_ip": public_ip.unwrap_or_else(|_| "unknown".to_string()),
+    });
+    Ok(result.to_string())
+}
+
+async fn check_system_gpu() -> Result<serde_json::Value, String> {
+    #[cfg(target_os = "macos")]
+    {
+        // Apple Silicon: use system_profiler + powermetrics for temp (if available)
+        let sp = tokio::process::Command::new("system_profiler")
+            .args(["SPHardwareDataType"])
+            .output().await;
+        let sp_text = sp.map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
+
+        let chip = sp_text.lines()
+            .find(|l| l.contains("Chip:"))
+            .map(|l| l.split(':').last().unwrap_or("").trim().to_string())
+            .unwrap_or_else(|| "Apple Silicon".to_string());
+
+        // Total memory (unified)
+        let mem = tokio::process::Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output().await
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().unwrap_or(0))
+            .unwrap_or(0);
+        let vram_total_mb = mem / (1024 * 1024);
+
+        // GPU temp via powermetrics (may need sudo, so fallback gracefully)
+        let temp_out = tokio::process::Command::new("sudo")
+            .args(["powermetrics", "--samplers", "smc", "-i1", "-n1"])
+            .output().await;
+        let temp: Option<f64> = temp_out.ok().and_then(|o| {
+            let s = String::from_utf8_lossy(&o.stdout).to_string();
+            s.lines()
+                .find(|l| l.contains("GPU die temperature"))
+                .and_then(|l| {
+                    l.split_whitespace()
+                        .find_map(|w| w.trim_end_matches('C').parse::<f64>().ok())
+                })
+        });
+
+        Ok(serde_json::json!({
+            "model": chip,
+            "temp_c": temp,
+            "vram_used_mb": null,
+            "vram_total_mb": vram_total_mb,
+            "utilization_pct": null,
+            "is_apple_silicon": true,
+        }))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // NVIDIA: nvidia-smi CSV query
+        let smi_path = find_nvidia_smi().unwrap_or_else(|| "nvidia-smi".to_string());
+        let out = tokio::process::Command::new(&smi_path)
+            .args(["--query-gpu=name,temperature.gpu,memory.used,memory.total,utilization.gpu", "--format=csv,noheader,nounits"])
+            .output().await;
+        match out {
+            Ok(o) if o.status.success() => {
+                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                let parts: Vec<&str> = s.split(',').map(|p| p.trim()).collect();
+                if parts.len() >= 5 {
+                    Ok(serde_json::json!({
+                        "model": parts[0],
+                        "temp_c": parts[1].parse::<f64>().ok(),
+                        "vram_used_mb": parts[2].parse::<u64>().ok(),
+                        "vram_total_mb": parts[3].parse::<u64>().ok(),
+                        "utilization_pct": parts[4].parse::<f64>().ok(),
+                        "is_apple_silicon": false,
+                    }))
+                } else {
+                    Ok(serde_json::json!({"model": "NVIDIA (parse error)", "temp_c": null, "vram_used_mb": null, "vram_total_mb": null, "utilization_pct": null, "is_apple_silicon": false}))
+                }
+            }
+            _ => Ok(serde_json::json!({"model": "unknown", "temp_c": null, "vram_used_mb": null, "vram_total_mb": null, "utilization_pct": null, "is_apple_silicon": false}))
+        }
+    }
+}
+
+async fn check_system_ram() -> Result<serde_json::Value, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let total = tokio::process::Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output().await
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u64>().unwrap_or(0))
+            .unwrap_or(0);
+        let total_mb = total / (1024 * 1024);
+
+        // vm_stat gives page-level data
+        let vm = tokio::process::Command::new("vm_stat")
+            .output().await;
+        let vm_str = vm.map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
+
+        let page_size: u64 = 16384; // Apple Silicon default
+        let mut free_pages: u64 = 0;
+        let mut inactive_pages: u64 = 0;
+        let mut speculative_pages: u64 = 0;
+        for line in vm_str.lines() {
+            if line.contains("Pages free:") {
+                free_pages = line.split(':').last().unwrap_or("0").trim().trim_end_matches('.').parse().unwrap_or(0);
+            } else if line.contains("Pages inactive:") {
+                inactive_pages = line.split(':').last().unwrap_or("0").trim().trim_end_matches('.').parse().unwrap_or(0);
+            } else if line.contains("Pages speculative:") {
+                speculative_pages = line.split(':').last().unwrap_or("0").trim().trim_end_matches('.').parse().unwrap_or(0);
+            }
+        }
+        let free_mb = (free_pages + inactive_pages + speculative_pages) * page_size / (1024 * 1024);
+        let used_mb = total_mb.saturating_sub(free_mb);
+
+        Ok(serde_json::json!({
+            "total_mb": total_mb,
+            "used_mb": used_mb,
+            "free_mb": free_mb,
+        }))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let out = tokio::process::Command::new("free")
+            .args(["-m"])
+            .output().await;
+        let s = out.map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
+        let mem_line = s.lines().find(|l| l.starts_with("Mem:")).unwrap_or("");
+        let parts: Vec<&str> = mem_line.split_whitespace().collect();
+        if parts.len() >= 4 {
+            Ok(serde_json::json!({
+                "total_mb": parts[1].parse::<u64>().unwrap_or(0),
+                "used_mb": parts[2].parse::<u64>().unwrap_or(0),
+                "free_mb": parts[3].parse::<u64>().unwrap_or(0),
+            }))
+        } else {
+            Ok(serde_json::json!({"total_mb": 0, "used_mb": 0, "free_mb": 0}))
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let out = tokio::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", "Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize,FreePhysicalMemory | ConvertTo-Json"])
+            .output().await;
+        let s = out.map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+            let total_kb = v["TotalVisibleMemorySize"].as_u64().unwrap_or(0);
+            let free_kb = v["FreePhysicalMemory"].as_u64().unwrap_or(0);
+            Ok(serde_json::json!({
+                "total_mb": total_kb / 1024,
+                "used_mb": (total_kb - free_kb) / 1024,
+                "free_mb": free_kb / 1024,
+            }))
+        } else {
+            Ok(serde_json::json!({"total_mb": 0, "used_mb": 0, "free_mb": 0}))
+        }
+    }
+}
+
+async fn check_system_disk() -> Result<serde_json::Value, String> {
+    let df = tokio::process::Command::new("df")
+        .args(["-h", "/"])
+        .output().await;
+    let df_str = df.map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
+    let lines: Vec<&str> = df_str.lines().collect();
+    if lines.len() >= 2 {
+        let parts: Vec<&str> = lines[1].split_whitespace().collect();
+        if parts.len() >= 5 {
+            return Ok(serde_json::json!({
+                "total": parts[1],
+                "used": parts[2],
+                "free": parts[3],
+                "percent": parts[4].trim_end_matches('%').parse::<u32>().unwrap_or(0),
+            }));
+        }
+    }
+    Ok(serde_json::json!({"total": "?", "used": "?", "free": "?", "percent": 0}))
+}
+
+async fn check_system_ollama() -> Result<serde_json::Value, String> {
+    let health = tokio::process::Command::new("curl")
+        .args(["-sf", "--max-time", "3", "http://localhost:11434/"])
+        .output().await;
+    let up = health.map(|o| o.status.success()).unwrap_or(false);
+
+    if !up {
+        return Ok(serde_json::json!({"up": false, "models": [], "running": []}));
+    }
+
+    let tags = tokio::process::Command::new("curl")
+        .args(["-sf", "--max-time", "3", "http://localhost:11434/api/tags"])
+        .output().await;
+    let tags_str = tags.map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
+    let models: Vec<String> = serde_json::from_str::<serde_json::Value>(&tags_str)
+        .ok()
+        .and_then(|v| v["models"].as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|m| m["name"].as_str().map(|s| s.to_string()))
+        .collect();
+
+    let ps = tokio::process::Command::new("curl")
+        .args(["-sf", "--max-time", "3", "http://localhost:11434/api/ps"])
+        .output().await;
+    let ps_str = ps.map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
+    let running: Vec<serde_json::Value> = serde_json::from_str::<serde_json::Value>(&ps_str)
+        .ok()
+        .and_then(|v| v["models"].as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .map(|m| serde_json::json!({
+            "name": m["name"].as_str().unwrap_or("?"),
+            "size_mb": m["size"].as_u64().unwrap_or(0) / (1024 * 1024),
+            "vram_mb": m["size_vram"].as_u64().unwrap_or(0) / (1024 * 1024),
+        }))
+        .collect();
+
+    Ok(serde_json::json!({
+        "up": true,
+        "models": models,
+        "running": running,
+    }))
+}
+
+async fn check_system_wg() -> Result<serde_json::Value, String> {
+    let gateway = read_wg_gateway();
+
+    let ping = tokio::process::Command::new("ping")
+        .args(["-c", "1", "-W", "2", &gateway])
+        .output().await;
+    let gw_reachable = ping.map(|o| o.status.success()).unwrap_or(false);
+
+    let wg_out = tokio::process::Command::new("sudo")
+        .args(["wg", "show"])
+        .output().await;
+    let wg_info = wg_out.map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
+    let has_handshake = wg_info.contains("latest handshake");
+
+    // Extract handshake age string (e.g. "1 minute, 32 seconds ago")
+    let handshake_age = wg_info.lines()
+        .find(|l| l.contains("latest handshake"))
+        .and_then(|l| l.split(':').last())
+        .map(|s| s.trim().to_string());
+
+    let ip = tokio::process::Command::new("sh")
+        .args(["-c", "ifconfig | grep -A2 utun | grep 'inet ' | awk '{print $2}'"])
+        .output().await
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+
+    Ok(serde_json::json!({
+        "up": gw_reachable,
+        "mesh_ip": if ip.is_empty() { "none".to_string() } else { ip },
+        "gateway": gateway,
+        "gateway_reachable": gw_reachable,
+        "handshake": has_handshake,
+        "handshake_age": handshake_age,
+    }))
+}
+
+async fn check_system_uptime() -> Result<String, String> {
+    // DCP connection uptime — how long the Hermes gateway has been running
+    let hermes_pid = tokio::process::Command::new("pgrep")
+        .args(["-f", "hermes_cli.main"])
+        .output().await;
+    if let Ok(out) = hermes_pid {
+        let pid = String::from_utf8_lossy(&out.stdout).trim().lines().next().unwrap_or("").to_string();
+        if !pid.is_empty() {
+            // Get process start time
+            #[cfg(target_os = "macos")]
+            {
+                let ps = tokio::process::Command::new("ps")
+                    .args(["-o", "etime=", "-p", &pid])
+                    .output().await;
+                if let Ok(o) = ps {
+                    let etime = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    if !etime.is_empty() {
+                        return Ok(etime);
+                    }
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let ps = tokio::process::Command::new("ps")
+                    .args(["-o", "etime=", "-p", &pid])
+                    .output().await;
+                if let Ok(o) = ps {
+                    let etime = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    if !etime.is_empty() {
+                        return Ok(etime);
+                    }
+                }
+            }
+        }
+    }
+    // Fallback: check agent-state.json for uptime_since
+    let state_path = dirs::home_dir().unwrap_or_default().join(".dcp").join("agent-state.json");
+    if let Ok(raw) = std::fs::read_to_string(&state_path) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+            if let Some(since) = v["uptime_since"].as_str() {
+                return Ok(format!("since {}", &since[..16].replace('T', " ")));
+            }
+        }
+    }
+    Ok("unknown".into())
+}
+
+async fn check_system_public_ip() -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(4))
+        .build().map_err(|e| format!("{}", e))?;
+    let res = client.get("https://api.ipify.org").send().await.map_err(|e| format!("{}", e))?;
+    let ip = res.text().await.map_err(|e| format!("{}", e))?;
+    Ok(ip.trim().to_string())
+}
+
+// ── Read agent insights (real system observations) ──────────────────
+
+#[tauri::command]
+fn read_agent_insights() -> Result<String, String> {
+    let path = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".dcp")
+        .join("agent-insights.json");
+    std::fs::read_to_string(&path)
+        .map_err(|e| format!("No insights yet: {}", e))
+}
+
+// ── Hide window to tray ──────────────────────────────────────────────
+
+#[tauri::command]
+fn hide_agent_panel(app: AppHandle) -> Result<(), String> {
+    if let Some(win) = app.get_webview_window("main") {
+        win.hide().map_err(|e| format!("{}", e))?;
+    }
+    Ok(())
+}
+
+// ── Ollama speed probe ───────────────────────────────────────────────
+
+#[tauri::command]
+async fn ollama_speed_probe() -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build().map_err(|e| format!("{}", e))?;
+    let res = client
+        .post("http://localhost:11434/api/generate")
+        .json(&serde_json::json!({"model":"qwen3:4b","prompt":"hi","stream":false}))
+        .send().await.map_err(|e| format!("{}", e))?;
+    let body: serde_json::Value = res.json().await.map_err(|e| format!("{}", e))?;
+    let eval_count = body["eval_count"].as_f64().unwrap_or(0.0);
+    let eval_duration = body["eval_duration"].as_f64().unwrap_or(1.0);
+    let tps = eval_count / eval_duration * 1e9;
+    Ok(format!("{:.0}", tps))
+}
+
+// ── Agent state reader ───────────────────────────────────────────────
+
+#[tauri::command]
+fn get_hermes_session_token() -> Result<String, String> {
+    let path = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".dcp")
+        .join("hermes-session-token");
+    std::fs::read_to_string(&path)
+        .map_err(|_| "dcp-agent-ws-token-fixed".to_string())
+        .or(Ok("dcp-agent-ws-token-fixed".to_string()))
+}
+
+#[tauri::command]
+fn read_agent_state() -> Result<String, String> {
+    let state_path = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".dcp")
+        .join("agent-state.json");
+    std::fs::read_to_string(&state_path)
+        .map_err(|e| format!("Cannot read agent state: {}", e))
 }
 
 // ── Tier 2.7 / G56 — tray helpers ────────────────────────────────────
@@ -5090,6 +6015,17 @@ async fn reconnect_network() -> Result<String, String> {
     setup_wireguard(&dcp_dir, &api_key).await
 }
 
+/// Send a native OS notification — called from the frontend on new job detection.
+#[tauri::command]
+fn notify_provider(app: AppHandle, title: String, body: String) -> Result<(), String> {
+    app.notification()
+        .builder()
+        .title(&title)
+        .body(&body)
+        .show()
+        .map_err(|e| format!("Notification failed: {}", e))
+}
+
 // ── App Entry ────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -5121,6 +6057,7 @@ pub fn run() {
         .setup(|app| {
             // ── System tray setup ────────────────────────────────────
             let show = MenuItemBuilder::with_id("show", "Open DCP Provider").build(app)?;
+            let agent_chat = MenuItemBuilder::with_id("agent_chat", "Chat with Agent").build(app)?;
             let earnings = MenuItemBuilder::with_id("earnings", "Earnings: calculating...").enabled(false).build(app)?;
             let status = MenuItemBuilder::with_id("status", "Status: Starting...").enabled(false).build(app)?;
             let separator1 = tauri::menu::PredefinedMenuItem::separator(app)?;
@@ -5136,7 +6073,7 @@ pub fn run() {
 
             let menu = MenuBuilder::new(app)
                 .items(&[
-                    &show, &separator1,
+                    &show, &agent_chat, &separator1,
                     &status, &earnings, &separator2,
                     &pause, &resume, &separator3,
                     &dashboard, &logs, &separator4,
@@ -5175,6 +6112,14 @@ pub fn run() {
                             if let Some(w) = app.get_webview_window("main") {
                                 let _ = w.show();
                                 let _ = w.set_focus();
+                            }
+                        }
+                        "agent_chat" => {
+                            if let Some(w) = app.get_webview_window("main") {
+                                let _ = w.show();
+                                let _ = w.set_focus();
+                                // Emit event to switch to agent chat view
+                                let _ = w.emit("navigate", "agent");
                             }
                         }
                         "dashboard" => {
@@ -5404,6 +6349,20 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             detect_gpu,
             detect_system,
+            read_agent_state,
+            agent_chat,
+            resize_window,
+            fetch_provider_earnings,
+            ollama_speed_probe,
+            hide_agent_panel,
+            read_agent_insights,
+            get_hermes_session_token,
+            agent_fix_wireguard,
+            agent_fix_ollama,
+            check_wireguard,
+            check_ollama,
+            check_disk,
+            check_system,
             validate_api_key,
             start_daemon,
             get_estimated_earnings,
@@ -5431,6 +6390,7 @@ pub fn run() {
             rotate_network_key,
             reconnect_network,
             open_install_log,
+            notify_provider,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

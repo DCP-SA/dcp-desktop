@@ -5,10 +5,12 @@ import { Account } from "./components/Account";
 import { Configuration } from "./components/Configuration";
 import { Installing } from "./components/Installing";
 import { Dashboard } from "./components/Dashboard";
+import { AgentChat } from "./components/AgentChat";
 import { checkSetupComplete } from "./lib/api";
 import type { GpuInfo, SystemInfo, DaemonConfig } from "./lib/api";
+import "./components/agent-chat.css";
 
-type AppView = "loading" | "wizard" | "dashboard";
+type AppView = "loading" | "wizard" | "dashboard" | "agent";
 type WizardStep = "welcome" | "hardware" | "account" | "config" | "installing";
 
 const STEP_ORDER: WizardStep[] = [
@@ -20,7 +22,7 @@ const STEP_ORDER: WizardStep[] = [
 ];
 
 function App() {
-  const [view, setView] = useState<AppView>("loading");
+  const [view, setView] = useState<AppView>("agent");
   const [step, setStep] = useState<WizardStep>("welcome");
   const [gpu, setGpu] = useState<GpuInfo | null>(null);
   const [_system, setSystem] = useState<SystemInfo | null>(null);
@@ -36,7 +38,7 @@ function App() {
   useEffect(() => {
     async function init() {
       const setupDone = await checkSetupComplete();
-      setView(setupDone ? "dashboard" : "wizard");
+      setView(setupDone ? "agent" : "wizard");
 
       // Check for app updates (silent, non-blocking)
       try {
@@ -54,6 +56,23 @@ function App() {
       }
     }
     init();
+  }, []);
+
+  // Listen for tray "navigate" events
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    (async () => {
+      try {
+        const { listen } = await import("@tauri-apps/api/event");
+        unlisten = await listen<string>("navigate", (event) => {
+          if (event.payload === "agent") setView("agent");
+          else if (event.payload === "dashboard") setView("dashboard");
+        });
+      } catch {
+        // Not in Tauri context (dev browser)
+      }
+    })();
+    return () => { unlisten?.(); };
   }, []);
 
   const stepIndex = STEP_ORDER.indexOf(step);
@@ -87,9 +106,27 @@ function App() {
     );
   }
 
-  // Dashboard view
+  // Agent panel — the main view after setup
+  if (view === "agent") {
+    return <AgentChat />;
+  }
+
+  // Dashboard view — with agent chat button
   if (view === "dashboard") {
-    return <Dashboard />;
+    return (
+      <div style={{ height: "100%", display: "flex", flexDirection: "column" }}>
+        <Dashboard />
+        <button
+          className="agent-fab"
+          onClick={() => setView("agent")}
+          title="Chat with Agent"
+        >
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+          </svg>
+        </button>
+      </div>
+    );
   }
 
   // Wizard view

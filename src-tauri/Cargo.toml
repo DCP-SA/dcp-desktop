@@ -35,6 +35,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # G19 — sha256 manifest verify on update_daemon
 sha2 = "0.10"
 hex = "0.4"
+tokio-tungstenite = { version = "0.24", features = ["connect", "native-tls"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = ["Win32_Graphics_Dxgi"] }
