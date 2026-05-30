@@ -1434,29 +1434,17 @@ async fn start_daemon_process(api_key: String, state: State<'_, DaemonManager>) 
     let dcp_dir = dcp_home()?;
     let daemon_path = dcp_dir.join("dcp_daemon.py");
 
-    // 2. Download daemon if not present
+    // 2. Backlog #7 — download the daemon from the platform if not present.
+    //    The platform is the single source of the daemon (no bundled copy), so
+    //    fetch + verify (size + sha256) against the manifest BEFORE writing.
+    //    Fail-safe: if the verified fetch fails, surface the error and DO NOT
+    //    spawn — never run a stale/missing daemon.
     if !daemon_path.exists() {
-        // Audit 2026-05-30 — key sent via x-api-key header only, not as ?key= URL param.
-        let download_url = "https://api.dcp.sa/api/providers/download/daemon".to_string();
-        let client = reqwest::Client::new();
-        let resp = client
-            .get(&download_url)
-            .header("x-api-key", &api_key)
-            .send()
+        let verified = fetch_verified_daemon(&api_key)
             .await
-            .map_err(|e| format!("Failed to download daemon: {}", e))?;
-
-        if !resp.status().is_success() {
-            return Err(format!("Failed to download daemon: HTTP {}", resp.status()));
-        }
-
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| format!("Failed to read daemon download: {}", e))?;
-
-        // M11 — atomic write so we never spawn a half-downloaded daemon
-        atomic_write(&daemon_path, &bytes)
+            .map_err(|e| format!("Couldn't fetch daemon from platform: {}", e))?;
+        // M11 — atomic write so we never spawn a half-downloaded daemon.
+        atomic_write(&daemon_path, &verified.bytes)
             .map_err(|e| format!("Failed to write daemon file: {}", e))?;
     }
 
@@ -2457,25 +2445,42 @@ struct DaemonManifest {
     sha256: String,
 }
 
-#[tauri::command]
-async fn update_daemon(api_key: String) -> Result<String, String> {
+/// Verified daemon bytes + the manifest version that produced them.
+struct VerifiedDaemon {
+    bytes: Vec<u8>,
+    version: String,
+}
+
+/// Backlog #7 — single daemon source. Fetch the platform-served daemon and
+/// verify it against the server-computed manifest (size + sha256) BEFORE the
+/// caller is allowed to write or spawn it. The platform is the ONE source of
+/// the daemon: there is no bundled/forked copy, so every node converges to
+/// whatever the manifest pins.
+///
+/// Audit G19 — the manifest is computed server-side over the EXACT bytes that
+/// /download/daemon serves for this api_key (post-injection of
+/// API_KEY/API_URL/HMAC_SECRET). Verifying here means a path-injection or
+/// in-flight tamper between the backend and this client can never be written
+/// into ~/.dcp.
+///
+/// Fail-safe: returns a clear `Err` on any network/HTTP/parse/mismatch failure.
+/// Callers MUST NOT spawn a daemon when this errors — surface "couldn't fetch
+/// daemon" rather than silently running a stale or missing one.
+async fn fetch_verified_daemon(api_key: &str) -> Result<VerifiedDaemon, String> {
     use sha2::{Digest, Sha256};
 
-    let dcp_dir = dcp_home()?;
-    let daemon_path = dcp_dir.join("dcp_daemon.py");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_default();
 
-    // 1. Audit G19 — fetch the manifest first. The manifest is computed
-    //    server-side over the EXACT bytes that /download/daemon would serve
-    //    for this api_key (post-injection of API_KEY/API_URL/HMAC_SECRET).
-    //    Without this check a path-injection or in-flight tamper between the
-    //    backend and this client would be silently atomic_write'd into ~/.dcp.
+    // 1. Fetch the manifest first.
     // Audit 2026-05-30 — key sent via x-api-key header only, not as ?key= URL param.
     let manifest_url =
         "https://api.dcp.sa/api/providers/download/daemon/manifest".to_string();
     let manifest_resp = client
         .get(&manifest_url)
-        .header("x-api-key", &api_key)
+        .header("x-api-key", api_key)
         .send()
         .await
         .map_err(|e| format!("Failed to fetch daemon manifest: {}", e))?;
@@ -2495,7 +2500,7 @@ async fn update_daemon(api_key: String) -> Result<String, String> {
     let download_url = "https://api.dcp.sa/api/providers/download/daemon".to_string();
     let resp = client
         .get(&download_url)
-        .header("x-api-key", &api_key)
+        .header("x-api-key", api_key)
         .send()
         .await
         .map_err(|e| format!("Failed to download daemon: {}", e))?;
@@ -2509,8 +2514,8 @@ async fn update_daemon(api_key: String) -> Result<String, String> {
         .await
         .map_err(|e| format!("Failed to read daemon download: {}", e))?;
 
-    // 3. Audit G19 — verify size + sha256 against the manifest BEFORE any
-    //    process kill or filesystem write. Reject on mismatch with a clear
+    // 3. Audit G19 — verify size + sha256 against the manifest BEFORE the
+    //    caller writes or spawns anything. Reject on mismatch with a clear
     //    error so the UI escape (Tier 3.15 / C2) can surface it.
     if new_bytes.len() as u64 != manifest.size {
         return Err(format!(
@@ -2529,9 +2534,26 @@ async fn update_daemon(api_key: String) -> Result<String, String> {
         ));
     }
 
+    Ok(VerifiedDaemon {
+        bytes: new_bytes.to_vec(),
+        version: manifest.version,
+    })
+}
+
+#[tauri::command]
+async fn update_daemon(api_key: String) -> Result<String, String> {
+    let dcp_dir = dcp_home()?;
+    let daemon_path = dcp_dir.join("dcp_daemon.py");
+
+    // 1-3. Backlog #7 / Audit G19 — fetch + verify against the manifest BEFORE
+    //       any process kill or filesystem write.
+    let verified = fetch_verified_daemon(&api_key).await?;
+    let new_bytes = verified.bytes;
+    let manifest_version = verified.version;
+
     // 4. Compare with current file (now safe — bytes are verified).
     let current_bytes = std::fs::read(&daemon_path).unwrap_or_default();
-    if current_bytes == new_bytes.as_ref() {
+    if current_bytes == new_bytes {
         return Ok("already_latest".to_string());
     }
 
@@ -2569,7 +2591,7 @@ async fn update_daemon(api_key: String) -> Result<String, String> {
     atomic_write(&daemon_path, &new_bytes)
         .map_err(|e| format!("Failed to write updated daemon: {}", e))?;
 
-    Ok(format!("updated:{}:{}", manifest.version, backup_status))
+    Ok(format!("updated:{}:{}", manifest_version, backup_status))
 }
 
 // Audit G6 (Tier 4.18) — companion to update_daemon. Restores ~/.dcp/dcp_daemon.py
@@ -4697,100 +4719,47 @@ async fn full_start_provider_inner(window: &tauri::Window, api_key: &str, state:
     let daemon_path = dcp_dir.join("dcp_daemon.py");
     let mut daemon_version = "latest".to_string();
     {
-        use sha2::{Digest, Sha256};
-
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .unwrap_or_default();
-
-        // 4a. Fetch manifest for size + sha256 verification
-        // Audit 2026-05-30 — key sent via x-api-key header only, not as ?key= URL param.
-        let manifest_url =
-            "https://api.dcp.sa/api/providers/download/daemon/manifest".to_string();
-        let manifest_result = client
-            .get(&manifest_url)
-            .header("x-api-key", api_key)
-            .send()
-            .await;
-
-        let manifest: Option<DaemonManifest> = match manifest_result {
-            Ok(resp) if resp.status().is_success() => {
-                match resp.json::<DaemonManifest>().await {
-                    Ok(m) => {
-                        daemon_version = m.version.clone();
-                        Some(m)
+        // Backlog #7 — single daemon source. The platform serves the ONE
+        // daemon; there is no bundled/forked copy. Fetch + verify (size +
+        // sha256) against the server manifest BEFORE writing or spawning.
+        match fetch_verified_daemon(api_key).await {
+            Ok(verified) => {
+                daemon_version = verified.version.clone();
+                // Verified — safe to write (M11 — atomic).
+                if let Err(e) = atomic_write(&daemon_path, &verified.bytes) {
+                    // Write failed: only safe to continue if a previously
+                    // verified daemon is already on disk.
+                    if !daemon_path.exists() {
+                        return Err(format!(
+                            "Couldn't write the downloaded daemon and none is installed: {}",
+                            e
+                        ));
                     }
-                    Err(e) => {
-                        log_startup!("Step 4a: Manifest parse failed: {} (skipping verification)", e);
-                        None
-                    }
+                    log_startup!("Step 4a: Daemon write failed: {} (keeping installed copy)", e);
+                } else {
+                    log_startup!(
+                        "Step 4a: Daemon v{} downloaded + verified ({} bytes, sha256 OK)",
+                        verified.version,
+                        verified.bytes.len()
+                    );
                 }
             }
-            Ok(resp) => {
-                log_startup!("Step 4a: Manifest fetch HTTP {} (skipping verification)", resp.status());
-                None
-            }
             Err(e) => {
-                log_startup!("Step 4a: Manifest fetch failed: {} (skipping verification)", e);
-                None
-            }
-        };
-
-        // 4b. Download daemon bytes
-        // Audit 2026-05-30 — key sent via x-api-key header only, not as ?key= URL param.
-        let download_url = "https://api.dcp.sa/api/providers/download/daemon".to_string();
-        match client.get(&download_url).header("x-api-key", api_key).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                match resp.bytes().await {
-                    Ok(bytes) => {
-                        // 4c. Verify against manifest if available
-                        if let Some(ref m) = manifest {
-                            if bytes.len() as u64 != m.size {
-                                log_startup!("Step 4a: Daemon size mismatch: manifest={} downloaded={} — refusing to install", m.size, bytes.len());
-                            } else {
-                                let mut hasher = Sha256::new();
-                                hasher.update(&bytes);
-                                let got = hex::encode(hasher.finalize());
-                                if !got.eq_ignore_ascii_case(&m.sha256) {
-                                    log_startup!("Step 4a: Daemon sha256 mismatch: manifest={} downloaded={} — refusing to install", m.sha256, got);
-                                } else {
-                                    // Verified — safe to write
-                                    if let Err(e) = atomic_write(&daemon_path, &bytes) {
-                                        log_startup!("Step 4a: Daemon write failed: {} (using cached)", e);
-                                    } else {
-                                        log_startup!("Step 4a: Daemon downloaded + verified ({} bytes, sha256 OK)", bytes.len());
-                                    }
-                                }
-                            }
-                        } else {
-                            // No manifest available (offline/error) — write without verification
-                            // but only if no cached daemon exists (first install fallback)
-                            if !daemon_path.exists() {
-                                if let Err(e) = atomic_write(&daemon_path, &bytes) {
-                                    log_startup!("Step 4a: Daemon write failed: {} (no cached version)", e);
-                                } else {
-                                    log_startup!("Step 4a: Daemon downloaded WITHOUT verification ({} bytes, manifest unavailable)", bytes.len());
-                                }
-                            } else {
-                                log_startup!("Step 4a: Skipping unverified update — keeping cached daemon");
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        log_startup!("Step 4a: Daemon download read failed: {} (using cached)", e);
-                    }
+                // Fail-safe: the verified fetch failed. Do NOT write or spawn an
+                // unverified daemon. If a previously verified daemon already
+                // exists we keep using it (transient network blip on a re-run);
+                // otherwise hard-fail with a clear error rather than running
+                // nothing or something stale.
+                if !daemon_path.exists() {
+                    return Err(format!("Couldn't fetch daemon from platform: {}", e));
                 }
-            }
-            Ok(resp) => {
-                log_startup!("Step 4a: Daemon download HTTP {} (using cached)", resp.status());
-            }
-            Err(e) => {
-                log_startup!("Step 4a: Daemon download failed: {} (using cached if exists)", e);
+                log_startup!("Step 4a: Daemon fetch failed: {} (keeping installed copy)", e);
             }
         }
         if !daemon_path.exists() {
-            return Err("Daemon file not found and download failed. Check internet connection.".to_string());
+            return Err(
+                "Daemon file not found and download failed. Check internet connection.".to_string(),
+            );
         }
     }
 
