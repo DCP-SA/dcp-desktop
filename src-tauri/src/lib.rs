@@ -768,7 +768,9 @@ async fn get_estimated_earnings(vram_mb: u64, is_apple_silicon: bool) -> Result<
 
 #[tauri::command]
 async fn fetch_provider_dashboard(api_key: String) -> Result<ProviderDashboard, String> {
-    let url = format!("{}/me?key={}", API_BASE, api_key);
+    // Audit 2026-05-30 — key sent via x-api-key header only, not as ?key= URL
+    // param (URL-borne credentials leak into proxy/CDN logs and referrers).
+    let url = format!("{}/me", API_BASE);
     let client = reqwest::Client::new();
     let resp = client
         .get(&url)
@@ -823,7 +825,8 @@ async fn fetch_provider_dashboard(api_key: String) -> Result<ProviderDashboard, 
 
 #[tauri::command]
 async fn fetch_provider_metrics(api_key: String) -> Result<ProviderMetrics, String> {
-    let url = format!("{}/me/metrics?key={}", API_BASE, api_key);
+    // Audit 2026-05-30 — key sent via x-api-key header only, not as ?key= URL param.
+    let url = format!("{}/me/metrics", API_BASE);
     let client = reqwest::Client::new();
     let resp = client
         .get(&url)
@@ -861,7 +864,8 @@ async fn fetch_provider_metrics(api_key: String) -> Result<ProviderMetrics, Stri
 #[tauri::command]
 async fn fetch_recent_jobs(api_key: String) -> Result<Vec<JobEntry>, String> {
     // Use the /me endpoint which includes recent_jobs in the response
-    let url = format!("{}/me?key={}", API_BASE, api_key);
+    // Audit 2026-05-30 — key sent via x-api-key header only, not as ?key= URL param.
+    let url = format!("{}/me", API_BASE);
     let client = reqwest::Client::new();
     let resp = client
         .get(&url)
@@ -1432,10 +1436,8 @@ async fn start_daemon_process(api_key: String, state: State<'_, DaemonManager>) 
 
     // 2. Download daemon if not present
     if !daemon_path.exists() {
-        let download_url = format!(
-            "https://api.dcp.sa/api/providers/download/daemon?key={}",
-            api_key
-        );
+        // Audit 2026-05-30 — key sent via x-api-key header only, not as ?key= URL param.
+        let download_url = "https://api.dcp.sa/api/providers/download/daemon".to_string();
         let client = reqwest::Client::new();
         let resp = client
             .get(&download_url)
@@ -2468,10 +2470,9 @@ async fn update_daemon(api_key: String) -> Result<String, String> {
     //    for this api_key (post-injection of API_KEY/API_URL/HMAC_SECRET).
     //    Without this check a path-injection or in-flight tamper between the
     //    backend and this client would be silently atomic_write'd into ~/.dcp.
-    let manifest_url = format!(
-        "https://api.dcp.sa/api/providers/download/daemon/manifest?key={}",
-        api_key
-    );
+    // Audit 2026-05-30 — key sent via x-api-key header only, not as ?key= URL param.
+    let manifest_url =
+        "https://api.dcp.sa/api/providers/download/daemon/manifest".to_string();
     let manifest_resp = client
         .get(&manifest_url)
         .header("x-api-key", &api_key)
@@ -2490,10 +2491,8 @@ async fn update_daemon(api_key: String) -> Result<String, String> {
         .map_err(|e| format!("Failed to parse daemon manifest: {}", e))?;
 
     // 2. Download daemon bytes.
-    let download_url = format!(
-        "https://api.dcp.sa/api/providers/download/daemon?key={}",
-        api_key
-    );
+    // Audit 2026-05-30 — key sent via x-api-key header only, not as ?key= URL param.
+    let download_url = "https://api.dcp.sa/api/providers/download/daemon".to_string();
     let resp = client
         .get(&download_url)
         .header("x-api-key", &api_key)
@@ -4706,11 +4705,14 @@ async fn full_start_provider_inner(window: &tauri::Window, api_key: &str, state:
             .unwrap_or_default();
 
         // 4a. Fetch manifest for size + sha256 verification
-        let manifest_url = format!(
-            "https://api.dcp.sa/api/providers/download/daemon/manifest?key={}",
-            api_key
-        );
-        let manifest_result = client.get(&manifest_url).send().await;
+        // Audit 2026-05-30 — key sent via x-api-key header only, not as ?key= URL param.
+        let manifest_url =
+            "https://api.dcp.sa/api/providers/download/daemon/manifest".to_string();
+        let manifest_result = client
+            .get(&manifest_url)
+            .header("x-api-key", api_key)
+            .send()
+            .await;
 
         let manifest: Option<DaemonManifest> = match manifest_result {
             Ok(resp) if resp.status().is_success() => {
@@ -4736,8 +4738,9 @@ async fn full_start_provider_inner(window: &tauri::Window, api_key: &str, state:
         };
 
         // 4b. Download daemon bytes
-        let download_url = format!("https://api.dcp.sa/api/providers/download/daemon?key={}", api_key);
-        match client.get(&download_url).send().await {
+        // Audit 2026-05-30 — key sent via x-api-key header only, not as ?key= URL param.
+        let download_url = "https://api.dcp.sa/api/providers/download/daemon".to_string();
+        match client.get(&download_url).header("x-api-key", api_key).send().await {
             Ok(resp) if resp.status().is_success() => {
                 match resp.bytes().await {
                     Ok(bytes) => {
@@ -4976,7 +4979,7 @@ async fn full_start_provider_inner(window: &tauri::Window, api_key: &str, state:
 /// Called after every startup attempt, whether success or failure
 async fn upload_provider_logs(api_key: &str, dcp_dir: &std::path::Path) {
     let mut logs = serde_json::Map::new();
-    for filename in &["startup.log", "gpu-detection.log", "daemon.log", "daemon_error.log", "cloudflared.log", "wg0.conf"] {
+    for filename in &["startup.log", "gpu-detection.log", "daemon.log", "daemon_error.log", "cloudflared.log"] {
         let path = dcp_dir.join(filename);
         if path.exists() {
             if let Ok(content) = std::fs::read_to_string(&path) {
