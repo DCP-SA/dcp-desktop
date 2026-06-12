@@ -24,8 +24,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-        with:
-          submodules: recursive
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -78,8 +76,6 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
         with:
           submodules: recursive
       - uses: actions/setup-node@v4
@@ -141,8 +137,6 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
         with:
           submodules: recursive
       - uses: actions/setup-node@v4
