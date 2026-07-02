@@ -3330,10 +3330,35 @@ done
 
     #[cfg(windows)]
     {
-        // Windows: try wireguard.exe /installtunnelservice
+        // Windows: `wireguard.exe /installtunnelservice <conf>` registers the
+        // tunnel as a Windows *service*, which REQUIRES ADMIN. This app runs as a
+        // normal user (RequestExecutionLevel user), so a plain non-elevated call
+        // fails with access-denied — the config gets saved but the tunnel never
+        // activates: no handshake, provider endpoint unreachable, node can't
+        // serve. (Root cause of Node-1/Fadi "online but not servable", 2026-07-02.)
+        //
+        // Fix: elevate the install via PowerShell `Start-Process -Verb RunAs`,
+        // which raises a single UAC prompt (standard for VPN clients). -Wait
+        // -PassThru lets us propagate the child's exit code so a declined prompt
+        // or a real failure surfaces to the UI instead of silently no-op'ing.
         let conf_str = wg_conf_path.to_string_lossy().to_string();
-        let install_result = Command::new("wireguard")
-            .args(["/installtunnelservice", &conf_str])
+        let wg_exe = if std::path::Path::new(r"C:\Program Files\WireGuard\wireguard.exe").exists() {
+            r"C:\Program Files\WireGuard\wireguard.exe".to_string()
+        } else {
+            "wireguard".to_string()
+        };
+        // Escape single quotes for the PowerShell single-quoted string literals.
+        let esc = |s: &str| s.replace('\'', "''");
+        let ps = format!(
+            "$ErrorActionPreference='Stop'; \
+             $p = Start-Process -FilePath '{}' -ArgumentList '/installtunnelservice','{}' \
+                  -Verb RunAs -Wait -PassThru; \
+             exit $p.ExitCode",
+            esc(&wg_exe),
+            esc(&conf_str)
+        );
+        let install_result = Command::new("powershell")
+            .args(["-NoProfile", "-Command", &ps])
             .output();
         match install_result {
             Ok(output) if output.status.success() => {
@@ -3342,27 +3367,17 @@ done
             }
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                // Try alternate path
-                let wg_exe = r"C:\Program Files\WireGuard\wireguard.exe";
-                if std::path::Path::new(wg_exe).exists() {
-                    let retry = Command::new(wg_exe)
-                        .args(["/installtunnelservice", &conf_str])
-                        .output();
-                    match retry {
-                        Ok(o) if o.status.success() => {
-                            create_windows_firewall_rules();
-                            return Ok(());
-                        }
-                        _ => {}
-                    }
-                }
-                return Err(format!("wireguard /installtunnelservice failed: {}", stderr));
+                return Err(format!(
+                    "WireGuard tunnel activation needs admin approval. If a Windows \
+                     security prompt appeared, click Yes to connect your node. ({})",
+                    stderr.trim()
+                ));
             }
             Err(e) => {
                 if e.kind() == std::io::ErrorKind::NotFound {
                     return Err("WireGuard not found. Install from https://www.wireguard.com/install/".to_string());
                 }
-                return Err(format!("wireguard.exe failed: {}", e));
+                return Err(format!("Failed to launch elevated WireGuard install: {}", e));
             }
         }
     }
