@@ -43,7 +43,10 @@
     "windows": {
       "certificateThumbprint": null,
       "digestAlgorithm": "sha256",
-      "timestampUrl": ""
+      "timestampUrl": "",
+      "nsis": {
+        "installerHooks": "./windows/hooks.nsh"
+      }
     },
     "linux": {
       "deb": {
@@ -58,7 +61,8 @@
           "/usr/share/polkit-1/actions/sa.dcp.provider.policy": "../policy/sa.dcp.provider.policy",
           "/usr/lib/systemd/user/dcp-provider.service": "tauri/linux/systemd/dcp-provider.service"
         },
-        "postInstallScript": "tauri/linux/postinst.sh"
+        "postInstallScript": "tauri/linux/postinst.sh",
+        "preRemoveScript": "tauri/linux/prerm.sh"
       },
       "appimage": {
         "bundleMediaFramework": false
