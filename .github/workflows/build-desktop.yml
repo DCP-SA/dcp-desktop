@@ -218,3 +218,126 @@ jobs:
             src-tauri/target/release/bundle/appimage/*.sig
             src-tauri/target/release/bundle/deb/*.deb
           fail_on_unmatched_files: false
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Windows e2e installer-lifecycle test (PR #26): executes the freshly
+  # built NSIS installer on a real windows-latest box and asserts the
+  # daemon-stop / tunnel-cleanup / identity-preservation hook behaviors.
+  # Covers the PR checklist except interactive UAC-decline (runners are
+  # elevated, -Verb RunAs never prompts here).
+  windows-e2e-lifecycle:
+    name: Windows e2e installer lifecycle
+    needs: build-windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dcp-provider-windows-setup
+          path: setup
+
+      - name: e2e lifecycle checklist
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Start-Transcript -Path e2e-transcript.txt
+          $setup = (Get-ChildItem setup\*.exe | Select-Object -First 1).FullName
+          Write-Host "installer: $setup"
+          $dcp = Join-Path $env:USERPROFILE '.dcp'
+
+          function Fail($msg) { Write-Host "FAIL: $msg" -ForegroundColor Red; Stop-Transcript; exit 1 }
+          function Pass($msg) { Write-Host ('PASS: ' + $msg) -ForegroundColor Green }
+
+          function Start-FakeDaemon {
+            New-Item -ItemType Directory -Force -Path $dcp | Out-Null
+            Set-Content -Path (Join-Path $dcp 'dcp_daemon.py') -Value "import time`ntime.sleep(99999)"
+            Start-Process python -ArgumentList (Join-Path $dcp 'dcp_daemon.py'), '--no-watchdog' -WindowStyle Hidden
+            Start-Sleep 3
+            if (-not (Get-CimInstance Win32_Process -Filter "CommandLine LIKE '%dcp_daemon.py%'")) { Fail 'fixture: fake daemon did not start' }
+          }
+          function Daemon-Running { [bool](Get-CimInstance Win32_Process -Filter "CommandLine LIKE '%dcp_daemon.py%'") }
+          function Tunnel-Service { Get-Service -Name 'WireGuardTunnel$wg0' -ErrorAction SilentlyContinue }
+          function Find-Uninstall {
+            foreach ($hive in 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
+                              'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall',
+                              'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall') {
+              $k = Get-ChildItem $hive -ErrorAction SilentlyContinue | Where-Object {
+                ($_ | Get-ItemProperty -ErrorAction SilentlyContinue).DisplayName -like 'DCP Provider*' }
+              if ($k) { return ($k | Select-Object -First 1 | Get-ItemProperty) }
+            }
+            return $null
+          }
+          function Wait-Gone([scriptblock]$probe, [string]$what, [int]$secs = 90) {
+            for ($i = 0; $i -lt $secs; $i += 3) { if (-not (& $probe)) { return } ; Start-Sleep 3 }
+            Fail "$what still present after ${secs}s"
+          }
+
+          # ── fixtures: identity files, fake runtime, WireGuard + dummy tunnel ──
+          New-Item -ItemType Directory -Force -Path $dcp, (Join-Path $dcp 'python'), (Join-Path $dcp '.cache') | Out-Null
+          Set-Content (Join-Path $dcp 'config.json') '{"provider_key":"test-identity"}'
+          Set-Content (Join-Path $dcp 'python\python.exe.placeholder') 'x'
+          Set-Content (Join-Path $dcp '.cache\blob') 'x'
+          choco install wireguard -y --no-progress | Out-Null
+          $wgexe = 'C:\Program Files\WireGuard\wireguard.exe'
+          if (-not (Test-Path $wgexe)) { Fail 'fixture: wireguard.exe missing after choco install' }
+          $priv = & 'C:\Program Files\WireGuard\wg.exe' genkey
+          Set-Content (Join-Path $dcp 'wg0.conf') "[Interface]`nPrivateKey = $priv`nAddress = 10.99.0.2/32"
+          & $wgexe /installtunnelservice (Join-Path $dcp 'wg0.conf')
+          Start-Sleep 4
+          if (-not (Tunnel-Service)) { Fail 'fixture: tunnel service did not register' }
+          Pass 'fixtures ready (identity, runtime dummies, live WireGuardTunnel$wg0)'
+
+          # ── 1 · fresh silent install over a RUNNING daemon ──
+          Start-FakeDaemon
+          Start-Process $setup -ArgumentList '/S' -Wait
+          Start-Sleep 3
+          if (Daemon-Running) { Fail 'T1: daemon survived fresh install' } ; Pass 'T1: install killed running daemon'
+          if (-not (Find-Uninstall)) { Fail 'T1: app not registered after install' } ; Pass 'T1: app installed'
+          if (-not (Tunnel-Service)) { Fail 'T1: silent install must NOT touch the tunnel' } ; Pass 'T1: tunnel untouched by silent install'
+
+          # ── 2 · silent auto-UPDATE over a running daemon ──
+          Start-FakeDaemon
+          Start-Process $setup -ArgumentList '/S','/UPDATE' -Wait
+          Start-Sleep 3
+          if (Daemon-Running) { Fail 'T2: daemon survived update' } ; Pass 'T2: update killed daemon pre-swap'
+          if (-not (Tunnel-Service)) { Fail 'T2: update must NOT remove tunnel' } ; Pass 'T2: tunnel untouched by update'
+          if (-not (Find-Uninstall)) { Fail 'T2: app gone after update' } ; Pass 'T2: app intact after update'
+
+          # ── 3 · one-click uninstall: daemon + tunnel gone, identity kept, runtime purged ──
+          Start-FakeDaemon
+          $u = Find-Uninstall
+          Start-Process $u.UninstallString.Trim('"') -ArgumentList '/S' -Wait
+          Wait-Gone { Find-Uninstall } 'T3: app registry entry'
+          Start-Sleep 5
+          if (Daemon-Running) { Fail 'T3: daemon survived uninstall' } ; Pass 'T3: uninstall killed daemon'
+          Wait-Gone { Tunnel-Service } 'T3: tunnel service' 60
+          Pass 'T3: tunnel service deregistered'
+          if (-not (Test-Path (Join-Path $dcp 'config.json'))) { Fail 'T3: config.json was deleted (identity lost!)' }
+          if (-not (Test-Path (Join-Path $dcp 'wg0.conf'))) { Fail 'T3: wg0.conf was deleted (identity lost!)' }
+          Pass 'T3: identity preserved (config.json + wg0.conf)'
+          if (Test-Path (Join-Path $dcp 'python')) { Fail 'T3: runtime python\ not purged' }
+          if (Test-Path (Join-Path $dcp '.cache')) { Fail 'T3: .cache not purged' }
+          Pass 'T3: downloaded runtime purged'
+
+          # ── 4 · orphaned-service fallback: wireguard.exe gone, sc fallback cleans up ──
+          Start-Process $setup -ArgumentList '/S' -Wait
+          & $wgexe /installtunnelservice (Join-Path $dcp 'wg0.conf')
+          Start-Sleep 4
+          sc.exe stop 'WireGuardTunnel$wg0' | Out-Null; Start-Sleep 3
+          Rename-Item $wgexe "$wgexe.bak"
+          try {
+            $u = Find-Uninstall
+            Start-Process $u.UninstallString.Trim('"') -ArgumentList '/S' -Wait
+            Wait-Gone { Find-Uninstall } 'T4: app registry entry'
+            Wait-Gone { Tunnel-Service } 'T4: orphaned tunnel service' 60
+            Pass 'T4: sc.exe fallback removed orphaned tunnel service'
+          } finally { Rename-Item "$wgexe.bak" $wgexe -ErrorAction SilentlyContinue }
+
+          Write-Host ''
+          Write-Host 'ALL E2E LIFECYCLE TESTS PASSED' -ForegroundColor Green
+          Stop-Transcript
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-e2e-transcript
+          path: e2e-transcript.txt
